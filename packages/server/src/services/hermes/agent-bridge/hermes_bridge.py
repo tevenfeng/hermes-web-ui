@@ -388,7 +388,11 @@ class AgentPool:
                 agent_cfg = cfg.get("agent") or {}
                 prompt = str(agent_cfg.get("system_prompt", "") or "").strip() or None
 
-                agent = AIAgent(
+                # Build AIAgent kwargs — only include default_headers if the
+                # loaded AIAgent class actually accepts it (compat guard).
+                import inspect as _inspect
+                _agent_params = _inspect.signature(AIAgent.__init__).parameters
+                _agent_kwargs: dict[str, Any] = dict(
                     model=resolved_model,
                     max_iterations=_cfg_max_turns(cfg, 90),
                     provider=runtime.get("provider"),
@@ -414,6 +418,10 @@ class AgentPool:
                     tool_start_callback=self._tool_start_callback(session_id),
                     tool_complete_callback=self._tool_complete_callback(session_id),
                 )
+                if "default_headers" in _agent_params:
+                    _agent_kwargs["default_headers"] = runtime.get("default_headers")
+
+                agent = AIAgent(**_agent_kwargs)
                 agent.compression_enabled = False
                 self._install_compression_hook(agent, session_id)
 
