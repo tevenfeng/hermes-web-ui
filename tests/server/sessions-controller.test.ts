@@ -12,6 +12,8 @@ const localGetSessionDetailMock = vi.fn()
 const localSearchSessionsMock = vi.fn()
 const localDeleteSessionMock = vi.fn()
 const localRenameSessionMock = vi.fn()
+const localCreateSessionMock = vi.fn()
+const localUpdateSessionMock = vi.fn()
 const getGroupChatServerMock = vi.fn()
 const getLocalUsageStatsMock = vi.fn()
 const getActiveProfileNameMock = vi.fn()
@@ -49,14 +51,15 @@ vi.mock('../../packages/server/src/db/hermes/sessions-db', () => ({
   getUsageStatsFromDb: getUsageStatsFromDbMock,
 }))
 
-// Mock useLocalSessionStore to return false so we test the CLI path
 vi.mock('../../packages/server/src/db/hermes/session-store', () => ({
-  useLocalSessionStore: () => false,
   listSessions: localListSessionsMock,
   searchSessions: localSearchSessionsMock,
   getSessionDetail: localGetSessionDetailMock,
   deleteSession: localDeleteSessionMock,
   renameSession: localRenameSessionMock,
+  createSession: localCreateSessionMock,
+  getSession: getSessionMock,
+  updateSession: localUpdateSessionMock,
 }))
 
 vi.mock('../../packages/server/src/db/hermes/usage-store', () => ({
@@ -112,6 +115,8 @@ describe('session conversations controller', () => {
     localSearchSessionsMock.mockReset()
     localDeleteSessionMock.mockReset()
     localRenameSessionMock.mockReset()
+    localCreateSessionMock.mockReset()
+    localUpdateSessionMock.mockReset()
     getGroupChatServerMock.mockReset()
     getGroupChatServerMock.mockReturnValue(null)
     getLocalUsageStatsMock.mockReset()
@@ -296,6 +301,22 @@ describe('session conversations controller', () => {
     expect(ctx.body.model_usage).toEqual([
       { model: ' ', input_tokens: 2, output_tokens: 1, cache_read_tokens: 1, cache_write_tokens: 1, reasoning_tokens: 0, sessions: 1 },
     ])
+  })
+
+  it('sets a session model and provider in the local session store', async () => {
+    getSessionMock.mockReturnValue({ id: 'session-1' })
+
+    const mod = await import('../../packages/server/src/controllers/hermes/sessions')
+    const ctx: any = {
+      params: { id: 'session-1' },
+      request: { body: { model: 'grok-4', provider: 'xai' } },
+      body: null,
+    }
+    await mod.setModel(ctx)
+
+    expect(localCreateSessionMock).not.toHaveBeenCalled()
+    expect(localUpdateSessionMock).toHaveBeenCalledWith('session-1', { model: 'grok-4', provider: 'xai' })
+    expect(ctx.body).toEqual({ ok: true })
   })
 
   describe('exportSession', () => {
