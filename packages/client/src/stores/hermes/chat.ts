@@ -58,6 +58,7 @@ export interface PendingApproval {
 
 export interface Session {
   id: string
+  profile?: string
   title: string
   source?: string
   messages: Message[]
@@ -232,6 +233,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
 function mapHermesSession(s: SessionSummary): Session {
   return {
     id: s.id,
+    profile: s.profile || 'default',
     title: s.title || '',
     source: s.source || undefined,
     messages: [],
@@ -331,6 +333,7 @@ export const useChatStore = defineStore('chat', () => {
   const streamStates = ref<Map<string, { abort: () => void }>>(new Map())
   /** sessionId → server-reported isWorking status */
   const serverWorking = ref<Set<string>>(new Set())
+  const sessionProfileFilter = ref<string | null>(null)
   /** sessionId → queued message count */
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
@@ -389,10 +392,19 @@ export const useChatStore = defineStore('chat', () => {
     return streamStates.value.has(sessionId) || serverWorking.value.has(sessionId)
   }
 
-  async function loadSessions() {
+  function clearActiveSession() {
+    activeSessionId.value = null
+    activeSession.value = null
+    focusMessageId.value = null
+    setAbortState(null)
+    setCompressionState(null)
+    removeItem(storageKey())
+  }
+
+  async function loadSessions(profile?: string | null) {
     isLoadingSessions.value = true
     try {
-      const list = await fetchSessions()
+      const list = await fetchSessions(undefined, undefined, profile || undefined)
       const fresh = list.map(mapHermesSession)
       // Preserve already-loaded messages for sessions that are still present,
       // so we don't blow away the active session's messages on refresh.
@@ -410,6 +422,8 @@ export const useChatStore = defineStore('chat', () => {
         : sessions.value[0]?.id
       if (targetId) {
         await switchSession(targetId)
+      } else {
+        clearActiveSession()
       }
     } catch (err) {
       console.error('Failed to load sessions:', err)
@@ -439,14 +453,17 @@ export const useChatStore = defineStore('chat', () => {
   }
 
 
-  function createSession(): Session {
+  function createSession(options: { profile?: string; model?: string; provider?: string } = {}): Session {
     const session: Session = {
       id: uid(),
+      profile: options.profile || useProfilesStore().activeProfileName || 'default',
       title: '',
-      source: 'api_server',
+      source: 'cli',
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      model: options.model || undefined,
+      provider: options.provider || '',
     }
     sessions.value.unshift(session)
     return session
@@ -551,6 +568,10 @@ export const useChatStore = defineStore('chat', () => {
                 setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
               } else if (e.event === 'approval.resolved') {
                 clearPendingApproval({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'run.failed') {
+                addAgentErrorMessage(sessionId, e.error)
+                serverWorking.value.delete(sessionId)
+                queueLengths.value.delete(sessionId)
               } else if (e.event === 'tool.started') {
                 const msgs = getSessionMsgs(sessionId)
                 const toolCallId = e.tool_call_id as string | undefined
@@ -606,12 +627,13 @@ export const useChatStore = defineStore('chat', () => {
     resumeServerWorkingRun(sessionId)
   }
 
-  function newChat() {
-    const session = createSession()
-    // Inherit current global model
+  function newChat(options: { profile?: string; model?: string; provider?: string } = {}) {
     const appStore = useAppStore()
-    session.model = appStore.selectedModel || undefined
-    session.provider = appStore.selectedProvider || ''
+    const session = createSession({
+      profile: options.profile,
+      model: options.model || appStore.selectedModel || undefined,
+      provider: options.provider || appStore.selectedProvider || '',
+    })
     switchSession(session.id)
   }
 
@@ -673,6 +695,29 @@ export const useChatStore = defineStore('chat', () => {
     if (idx !== -1) {
       s.messages[idx] = { ...s.messages[idx], ...update }
     }
+  }
+
+  function addAgentErrorMessage(sessionId: string, error?: string | null) {
+    const content = error ? `Error: ${error}` : 'Run failed'
+    const msgs = getSessionMsgs(sessionId)
+    const last = msgs[msgs.length - 1]
+    if (last?.isStreaming) {
+      updateMessage(sessionId, last.id, {
+        role: 'assistant',
+        content,
+        isStreaming: false,
+        systemType: 'error',
+      })
+      return
+    }
+    if (last?.role === 'assistant' && last.systemType === 'error' && last.content === content) return
+    addMessage(sessionId, {
+      id: uid(),
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      systemType: 'error',
+    })
   }
 
   function handleSessionCommandEvent(evt: RunEvent) {
@@ -852,7 +897,10 @@ export const useChatStore = defineStore('chat', () => {
 
     // Capture session ID at send time — all callbacks use this, not activeSessionId
     const sid = activeSessionId.value!
-    const isBridgeSlashCommand = activeSession.value?.source === 'cli' && content.trim().startsWith('/')
+    const shouldSendInitialSessionConfig = activeSession.value
+      ? activeSession.value.messageCount == null || activeSession.value.messageCount === 0
+      : false
+    const isBridgeSlashCommand = content.trim().startsWith('/')
     const isBridgeCompressCommand = isBridgeSlashCommand && /^\/compress(?:\s|$)/i.test(content.trim())
     const wasLiveBeforeSend = isSessionLive(sid)
     const shouldQueue = wasLiveBeforeSend && !isBridgeSlashCommand
@@ -912,19 +960,22 @@ export const useChatStore = defineStore('chat', () => {
       const appStore = useAppStore()
       await appStore.waitForModelsForRun()
       const sessionModel = activeSession.value?.model || appStore.selectedModel
-      const isBridgeSource = activeSession.value?.source === 'cli'
       const sessionProvider = activeSession.value?.provider || appStore.selectedProvider
       const runPayload = {
         input,
         session_id: sid,
-        model: isBridgeSource ? undefined : sessionModel || undefined,
-        provider: isBridgeSource ? undefined : sessionProvider || undefined,
+        profile: shouldSendInitialSessionConfig ? activeSession.value?.profile || undefined : undefined,
+        model: shouldSendInitialSessionConfig ? sessionModel || undefined : undefined,
+        provider: shouldSendInitialSessionConfig ? sessionProvider || undefined : undefined,
         model_groups: appStore.modelGroups.map(group => ({
           provider: group.provider,
           models: group.models,
         })),
         queue_id: userMsg.id,
-        source: (isBridgeSource ? 'cli' : 'api_server') as 'cli' | 'api_server',
+        source: 'cli' as const,
+      }
+      if (shouldSendInitialSessionConfig && activeSession.value) {
+        activeSession.value.messageCount = Math.max(activeSession.value.messageCount || 0, 1)
       }
 
       if (shouldQueue) {
@@ -1296,22 +1347,8 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'run.failed': {
+              addAgentErrorMessage(sid, evt.error)
               const msgs = getSessionMsgs(sid)
-              const lastErr = msgs[msgs.length - 1]
-              if (lastErr?.isStreaming) {
-                updateMessage(sid, lastErr.id, {
-                  isStreaming: false,
-                  content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-                  role: 'system',
-                })
-              } else {
-                addMessage(sid, {
-                  id: uid(),
-                  role: 'system',
-                  content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-                  timestamp: Date.now(),
-                })
-              }
               msgs.forEach((m, i) => {
                 if (m.role === 'tool' && m.toolStatus === 'running') {
                   msgs[i] = { ...m, toolStatus: 'error' }
@@ -1348,20 +1385,14 @@ export const useChatStore = defineStore('chat', () => {
         // onError
         (err) => {
           console.warn('Socket.IO run stream error:', err.message)
+          addAgentErrorMessage(sid, err.message)
           const msgs = getSessionMsgs(sid)
-          const last = msgs[msgs.length - 1]
-          if (last?.isStreaming) {
-            updateMessage(sid, last.id, { isStreaming: false })
-          }
           msgs.forEach((m, i) => {
             if (m.role === 'tool' && m.toolStatus === 'running') {
-              msgs[i] = { ...m, toolStatus: 'done' }
+              msgs[i] = { ...m, toolStatus: 'error' }
             }
           })
           cleanup()
-          if (sid === activeSessionId.value) {
-            void refreshActiveSession()
-          }
         },
         undefined,
       )
@@ -1733,22 +1764,8 @@ export const useChatStore = defineStore('chat', () => {
           } else {
             queueLengths.value.delete(sid)
           }
+          addAgentErrorMessage(sid, evt.error)
           const msgs = getSessionMsgs(sid)
-          const lastErr = msgs[msgs.length - 1]
-          if (lastErr?.isStreaming) {
-            updateMessage(sid, lastErr.id, {
-              isStreaming: false,
-              content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-              role: 'system',
-            })
-          } else {
-            addMessage(sid, {
-              id: uid(),
-              role: 'system',
-              content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-              timestamp: Date.now(),
-            })
-          }
           msgs.forEach((m, i) => {
             if (m.role === 'tool' && m.toolStatus === 'running') {
               msgs[i] = { ...m, toolStatus: 'error' }
@@ -1929,6 +1946,7 @@ export const useChatStore = defineStore('chat', () => {
     isStreaming,
     isRunActive,
     isSessionLive,
+    sessionProfileFilter,
     compressionState,
     abortState,
     isAborting,
