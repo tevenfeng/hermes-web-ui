@@ -2,18 +2,20 @@ import { readFile } from 'fs/promises'
 import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getActiveEnvPath, getActiveAuthPath, getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
-import { readConfigYaml, readConfigYamlForProfile, updateConfigYaml, fetchProviderModels, buildModelGroups, PROVIDER_ENV_MAP } from '../../services/config-helpers'
+import { readConfigYaml, readConfigYamlForProfile, updateConfigYaml, updateConfigYamlForProfile, fetchProviderModels, buildModelGroups, PROVIDER_ENV_MAP } from '../../services/config-helpers'
 import { buildProviderModelMap, PROVIDER_PRESETS } from '../../shared/providers'
 import { getCopilotModelsDetailed, resolveCopilotOAuthToken, type CopilotModelMeta } from '../../services/hermes/copilot-models'
 import { readAppConfig, writeAppConfig, type ModelVisibilityRule } from '../../services/app-config'
 import { getDb } from '../../db'
 import { MODEL_CONTEXT_TABLE } from '../../db/hermes/schemas'
+import { listUserProfiles } from '../../db/hermes/users-store'
 
 const PROVIDER_MODEL_CATALOG = buildProviderModelMap()
 
 type ModelMeta = { preview?: boolean; disabled?: boolean; alias?: string }
 type AvailableGroup = { provider: string; label: string; base_url: string; models: string[]; api_key: string; builtin?: boolean; model_meta?: Record<string, ModelMeta>; available_models?: string[] }
 type ModelVisibility = Record<string, ModelVisibilityRule>
+type CustomModels = Record<string, string[]>
 
 const RESERVED_ALIAS_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
@@ -65,6 +67,28 @@ function applyModelAliases<T extends { provider: string; models: string[]; model
 function uniqueStrings(values: unknown): string[] {
   if (!Array.isArray(values)) return []
   return Array.from(new Set(values.map(v => String(v || '').trim()).filter(Boolean)))
+}
+
+function normalizeCustomModels(input: unknown): CustomModels {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const out: CustomModels = {}
+  for (const [provider, rawModels] of Object.entries(input as Record<string, unknown>)) {
+    const providerKey = String(provider || '').trim()
+    if (!providerKey) continue
+    const models = uniqueStrings(rawModels)
+    if (models.length > 0) out[providerKey] = models
+  }
+  return out
+}
+
+function applyCustomModels(groups: AvailableGroup[], customModels: CustomModels): AvailableGroup[] {
+  return groups.map(group => {
+    const extra = customModels[group.provider] || []
+    if (!extra.length) return group
+    const models = [...new Set([...group.models, ...extra])]
+    const availableModels = [...new Set([...(group.available_models || group.models), ...extra])]
+    return { ...group, models, available_models: availableModels }
+  })
 }
 
 function normalizeModelVisibility(input: unknown): ModelVisibility {
@@ -170,6 +194,31 @@ function mergeAvailableGroups(groups: AvailableGroup[]): AvailableGroup[] {
 }
 
 type ProviderFetchCache = Map<string, Promise<string[]>>
+
+function requestedProfileName(ctx: any): string {
+  const queryProfile = ctx.query?.profile
+  return typeof queryProfile === 'string' && queryProfile.trim() ? queryProfile.trim() : ''
+}
+
+function requestScopedProfileName(ctx: any): string {
+  const headerProfile = typeof ctx.get === 'function' ? ctx.get('x-hermes-profile') : ''
+  const queryProfile = typeof ctx.query?.profile === 'string' ? ctx.query.profile : ''
+  const bodyProfile = typeof ctx.request?.body?.profile === 'string' ? ctx.request.body.profile : ''
+  return ctx.state?.profile?.name ||
+    headerProfile.trim() ||
+    queryProfile.trim() ||
+    bodyProfile.trim() ||
+    getActiveProfileName() ||
+    'default'
+}
+
+function visibleProfileNamesForUser(ctx: any): string[] {
+  const diskProfiles = listProfileNamesFromDisk()
+  const user = ctx.state?.user
+  if (!user || user.role === 'super_admin') return diskProfiles
+  const allowed = new Set(listUserProfiles(user.id).map(profile => profile.profile_name))
+  return diskProfiles.filter(profile => allowed.has(profile))
+}
 
 function cachedProviderModels(
   cache: ProviderFetchCache,
@@ -349,27 +398,28 @@ async function buildAvailableForProfile(
     g.models = Array.from(new Set(g.models))
     g.available_models = Array.from(new Set(g.available_models || g.models))
   }
+  const groupsWithCustomModels = applyCustomModels(groups, normalizeCustomModels(appConfig.customModels))
 
-  return { profile, default: currentDefault, default_provider: currentDefaultProvider, groups }
+  return { profile, default: currentDefault, default_provider: currentDefaultProvider, groups: groupsWithCustomModels }
 }
 
 export async function getAvailable(ctx: any) {
   try {
-    const requestedProfile = typeof ctx.query.profile === 'string' && ctx.query.profile.trim()
-      ? ctx.query.profile.trim()
-      : ''
+    const requestedProfile = requestedProfileName(ctx)
     if (!requestedProfile) {
       const appConfig = await readAppConfig()
       const modelAliases = normalizeAliases(appConfig.modelAliases)
       const modelVisibility = normalizeModelVisibility(appConfig.modelVisibility)
+      const customModels = normalizeCustomModels(appConfig.customModels)
       const fetchCache: ProviderFetchCache = new Map()
+      const visibleProfiles = visibleProfileNamesForUser(ctx)
       const profileResults = await Promise.all(
-        listProfileNamesFromDisk().map(profile => buildAvailableForProfile(profile, fetchCache, appConfig)),
+        visibleProfiles.map(profile => buildAvailableForProfile(profile, fetchCache, appConfig)),
       )
       const mergedGroups = mergeAvailableGroups(profileResults.flatMap(result => result.groups))
       const groupsWithAliases = applyModelAliases(mergedGroups, modelAliases)
       const visibleGroups = applyModelVisibility(groupsWithAliases, modelVisibility)
-      const activeProfile = getActiveProfileName()
+      const activeProfile = requestScopedProfileName(ctx)
       const defaultProfile = profileResults.find(result => result.profile === activeProfile && (result.default || result.default_provider))
         || profileResults.find(result => result.default && result.default_provider)
         || profileResults.find(result => result.default)
@@ -392,6 +442,7 @@ export async function getAvailable(ctx: any) {
         allProviders: applyModelAliases(allProvidersBase, modelAliases),
         model_aliases: modelAliases,
         model_visibility: modelVisibility,
+        custom_models: customModels,
         profiles: profileResults.map(result => ({
           profile: result.profile,
           default: result.default,
@@ -405,6 +456,7 @@ export async function getAvailable(ctx: any) {
     const appConfigForProfile = await readAppConfig()
     const modelAliasesForProfile = normalizeAliases(appConfigForProfile.modelAliases)
     const modelVisibilityForProfile = normalizeModelVisibility(appConfigForProfile.modelVisibility)
+    const customModelsForProfile = normalizeCustomModels(appConfigForProfile.customModels)
     const profileResult = await buildAvailableForProfile(requestedProfile, new Map(), appConfigForProfile)
     const profileGroupsWithAliases = applyModelAliases(profileResult.groups, modelAliasesForProfile)
     const visibleProfileGroups = applyModelVisibility(profileGroupsWithAliases, modelVisibilityForProfile)
@@ -422,6 +474,7 @@ export async function getAvailable(ctx: any) {
       })), modelAliasesForProfile),
       model_aliases: modelAliasesForProfile,
       model_visibility: modelVisibilityForProfile,
+      custom_models: customModelsForProfile,
       profiles: [{
         profile: profileResult.profile,
         default: profileResult.default,
@@ -511,6 +564,7 @@ export async function getAvailable(ctx: any) {
     const copilotEnabled = appConfig.copilotEnabled === true
     const modelAliases = normalizeAliases(appConfig.modelAliases)
     const modelVisibility = normalizeModelVisibility(appConfig.modelVisibility)
+    const customModels = normalizeCustomModels(appConfig.customModels)
 
     // 兼容老用户：上一版本会"自动 fallback discovery"出 Copilot；升级后这些用户的
     // config.yaml 可能仍把 model.default 指向某个 copilot 模型。若此时 copilot 已不
@@ -598,7 +652,7 @@ export async function getAvailable(ctx: any) {
     }
 
     for (const g of groups) { g.models = Array.from(new Set(g.models)) }
-    const groupsWithAliases = applyModelAliases(groups, modelAliases)
+    const groupsWithAliases = applyModelAliases(applyCustomModels(groups, customModels), modelAliases)
     const visibleGroups = applyModelVisibility(groupsWithAliases, modelVisibility)
     const visibleDefault = resolveVisibleDefault(currentDefault, currentDefaultProvider, visibleGroups)
 
@@ -638,6 +692,7 @@ export async function getAvailable(ctx: any) {
         allProviders,
         model_aliases: modelAliases,
         model_visibility: modelVisibility,
+        custom_models: customModels,
       }
       return
     }
@@ -649,7 +704,56 @@ export async function getAvailable(ctx: any) {
       allProviders,
       model_aliases: modelAliases,
       model_visibility: modelVisibility,
+      custom_models: customModels,
     }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function addCustomModel(ctx: any) {
+  const { provider, model } = (ctx.request.body || {}) as { provider?: string; model?: string }
+  const providerKey = String(provider || '').trim()
+  const modelId = String(model || '').trim()
+  if (!providerKey || !modelId) {
+    ctx.status = 400
+    ctx.body = { error: 'Missing provider or model' }
+    return
+  }
+
+  try {
+    const appConfig = await readAppConfig()
+    const customModels = normalizeCustomModels(appConfig.customModels)
+    customModels[providerKey] = Array.from(new Set([...(customModels[providerKey] || []), modelId]))
+    const saved = await writeAppConfig({ customModels })
+    ctx.body = { success: true, custom_models: normalizeCustomModels(saved.customModels) }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function removeCustomModel(ctx: any) {
+  const body = (ctx.request.body || {}) as { provider?: string; model?: string }
+  const provider = body.provider ?? ctx.query?.provider
+  const model = body.model ?? ctx.query?.model
+  const providerKey = String(provider || '').trim()
+  const modelId = String(model || '').trim()
+  if (!providerKey || !modelId) {
+    ctx.status = 400
+    ctx.body = { error: 'Missing provider or model' }
+    return
+  }
+
+  try {
+    const appConfig = await readAppConfig()
+    const customModels = normalizeCustomModels(appConfig.customModels)
+    const remaining = (customModels[providerKey] || []).filter(item => item !== modelId)
+    if (remaining.length > 0) customModels[providerKey] = remaining
+    else delete customModels[providerKey]
+    const saved = await writeAppConfig({ customModels })
+    ctx.body = { success: true, custom_models: normalizeCustomModels(saved.customModels) }
   } catch (err: any) {
     ctx.status = 500
     ctx.body = { error: err.message }
@@ -767,7 +871,7 @@ export async function setModelAlias(ctx: any) {
 
 export async function getConfigModels(ctx: any) {
   try {
-    const config = await readConfigYaml()
+    const config = await readConfigYamlForProfile(requestScopedProfileName(ctx))
     ctx.body = buildModelGroups(config)
   } catch (err: any) {
     ctx.status = 500
@@ -783,7 +887,8 @@ export async function setConfigModel(ctx: any) {
     return
   }
   try {
-    await updateConfigYaml((config) => {
+    const profile = requestScopedProfileName(ctx)
+    await updateConfigYamlForProfile(profile, (config) => {
       config.model = {}
       config.model.default = defaultModel
       if (reqProvider) { config.model.provider = reqProvider }

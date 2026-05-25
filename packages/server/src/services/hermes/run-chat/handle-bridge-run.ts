@@ -8,11 +8,17 @@ import { getSystemPrompt } from '../../../lib/llm-prompt'
 import { getSession, createSession, addMessage, updateSession, updateSessionStats } from '../../../db/hermes/session-store'
 import { updateUsage } from '../../../db/hermes/usage-store'
 import { logger, bridgeLogger } from '../../logger'
-import { AgentBridgeClient, type AgentBridgeMessage, type AgentBridgeOutput } from '../agent-bridge'
+import { AgentBridgeClient, type AgentBridgeContextEstimate, type AgentBridgeMessage, type AgentBridgeOutput } from '../agent-bridge'
 import { contentBlocksToString, convertContentBlocksForAgent, extractTextForPreview, isContentBlockArray } from './content-blocks'
-import { buildCompressedHistory } from './compression'
-import { pushState, replaceState } from './compression'
-import { calcAndUpdateUsage, estimateUsageTokensFromMessages } from './usage'
+import { buildCompressedHistory, buildDbHistory, buildSnapshotAwareHistory, forceCompressBridgeHistory, pushState, replaceState } from './compression'
+import {
+  calcAndUpdateUsage,
+  contextTokensWithCachedOverhead,
+  estimateUsageTokensFromMessages,
+  getCachedBridgeContextOverhead,
+  updateContextTokenUsage,
+  updateMessageContextTokenUsage,
+} from './usage'
 import {
   flushBridgePendingToDb,
   ensureOpenBridgeAssistantMessage,
@@ -20,9 +26,7 @@ import {
   recordBridgeToolStarted,
   recordBridgeToolCompleted,
 } from './bridge-message'
-import { forceCompressBridgeHistory } from './compression'
 import { summarizeToolArguments } from './response-utils'
-import { buildDbHistory } from './compression'
 import type { ContentBlock, SessionState } from './types'
 import type { ChatMessage } from '../../../lib/context-compressor'
 import { resolveBridgeRunModelConfig, type RunModelGroup } from './model-config'
@@ -30,10 +34,67 @@ import { filterBridgeToolCallMarkupDelta } from './bridge-delta'
 
 const BRIDGE_USAGE_FLUSH_DELAY_MS = 200
 
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function looksLikeAgentFailure(value: string): boolean {
+  return /\bAPI call failed after\b/i.test(value)
+    || /\bHTTP\s+(?:4\d\d|5\d\d)\b/i.test(value)
+    || /\b(?:401|403|429|500|502|503|504)\b/.test(value) && /\b(?:unauthorized|forbidden|rate limit|unavailable|failed|error)\b/i.test(value)
+}
+
+export function bridgeTerminalError(chunk: Pick<AgentBridgeOutput, 'status' | 'error' | 'result'>): string | null {
+  const result = chunk.result && typeof chunk.result === 'object' && !Array.isArray(chunk.result)
+    ? chunk.result as Record<string, unknown>
+    : null
+  const resultError = result
+    ? stringValue(result.error)
+      || stringValue(result.exception)
+      || stringValue(result.message)
+    : ''
+  const finalResponse = result ? stringValue(result.final_response) : ''
+
+  if (chunk.status === 'error') {
+    return stringValue(chunk.error) || resultError || finalResponse || 'Agent run failed'
+  }
+
+  if (result?.failed === true || result?.completed === false) {
+    return resultError || finalResponse || 'Agent reported failure'
+  }
+
+  if (resultError) return resultError
+  if (finalResponse && looksLikeAgentFailure(finalResponse)) return finalResponse
+
+  return null
+}
+
+function finiteToken(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : undefined
+}
+
+function cacheBridgeContext(state: SessionState, data: Record<string, unknown> | AgentBridgeContextEstimate) {
+  const fixedContextTokens = finiteToken(data.fixed_context_tokens)
+  if (fixedContextTokens == null) return
+  state.bridgeContext = {
+    fixedContextTokens,
+    systemPromptTokens: finiteToken(data.system_prompt_tokens),
+    toolTokens: finiteToken(data.tool_tokens),
+    systemPromptChars: finiteToken(data.system_prompt_chars),
+    toolCount: finiteToken(data.tool_count),
+    toolNames: Array.isArray(data.tool_names) ? data.tool_names.map(String) : undefined,
+    profile: typeof data.profile === 'string' ? data.profile : state.bridgeContext?.profile,
+    model: typeof data.model === 'string' ? data.model : state.bridgeContext?.model,
+    provider: typeof data.provider === 'string' ? data.provider : state.bridgeContext?.provider,
+  }
+}
+
 export async function handleBridgeRun(
   nsp: ReturnType<Server['of']>,
   socket: Socket,
-  data: { input: string | ContentBlock[]; session_id?: string; model?: string; provider?: string; model_groups?: RunModelGroup[]; instructions?: string; source?: string },
+  data: { input: string | ContentBlock[]; session_id?: string; model?: string; provider?: string; model_groups?: RunModelGroup[]; instructions?: string; source?: string; queue_id?: string; peerExcludeSocketId?: string },
   profile: string,
   sessionMap: Map<string, SessionState>,
   bridge: AgentBridgeClient,
@@ -67,10 +128,12 @@ export async function handleBridgeRun(
     if (resolvedProvider && sessionRow.provider !== resolvedProvider) updates.provider = resolvedProvider
     if (Object.keys(updates).length > 0) updateSession(session_id, updates)
   }
-  if (sessionRow?.workspace) {
-    const workspaceCtx = `[Current working directory: ${sessionRow.workspace}]`
-    fullInstructions = `\n${workspaceCtx}\n${fullInstructions}`
-  }
+  const runContext = [
+    `[Current Hermes profile: ${profile}]`,
+    sessionRow?.workspace ? `[Current working directory: ${sessionRow.workspace}]` : '',
+    'When calling Hermes Web UI endpoints from tools or skills, include the current Hermes profile as the X-Hermes-Profile header if the endpoint supports profile-scoped behavior.',
+  ].filter(Boolean).join('\n')
+  fullInstructions = `\n${runContext}\n${fullInstructions}`
 
   const runMarker = `cli_run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
   const now = Math.floor(Date.now() / 1000)
@@ -84,6 +147,7 @@ export async function handleBridgeRun(
 
   state.isWorking = true
   state.isAborting = false
+  state.events = []
   state.profile = profile
   state.source = 'cli'
   state.activeRunMarker = runMarker
@@ -112,7 +176,7 @@ export async function handleBridgeRun(
     const preview = previewText.replace(/[\r\n]/g, ' ').substring(0, 100)
     createSession({ id: session_id, profile, source: 'cli', model: resolvedModel, provider: resolvedProvider, title: preview })
   }
-  addMessage({
+  const messageId = addMessage({
     session_id,
     role: 'user',
     content: inputStr,
@@ -120,6 +184,19 @@ export async function handleBridgeRun(
   })
 
   socket.join(`session:${session_id}`)
+  const peerTarget = data.peerExcludeSocketId
+    ? nsp.to(`session:${session_id}`).except(data.peerExcludeSocketId)
+    : socket.to(`session:${session_id}`)
+  peerTarget.emit('run.peer_user_message', {
+    event: 'run.peer_user_message',
+    session_id,
+    message: {
+      id: data.queue_id || messageId,
+      role: 'user',
+      content: inputStr,
+      timestamp: now,
+    },
+  })
   const emit = (event: string, payload: any) => {
     const tagged = { ...payload, session_id }
     nsp.to(`session:${session_id}`).emit(event, tagged)
@@ -135,6 +212,33 @@ export async function handleBridgeRun(
     emit,
     sessionMap,
     { model: resolvedModel, provider: resolvedProvider },
+    async (messages) => {
+      const cachedOverhead = getCachedBridgeContextOverhead(state)
+      if (cachedOverhead != null) {
+        const messageUsage = estimateUsageTokensFromMessages(messages)
+        return cachedOverhead + messageUsage.inputTokens + messageUsage.outputTokens
+      }
+      const estimate = await bridge.contextEstimate(
+        session_id,
+        messages,
+        fullInstructions,
+        profile,
+        { model: resolvedModel, provider: resolvedProvider },
+      )
+      cacheBridgeContext(state, estimate)
+      bridgeLogger.info({
+        sessionId: session_id,
+        profile,
+        model: resolvedModel,
+        provider: resolvedProvider,
+        messages: estimate.message_count,
+        toolCount: estimate.tool_count,
+        systemPromptChars: estimate.system_prompt_chars,
+        fixedContextTokens: estimate.fixed_context_tokens,
+        fullContextTokens: estimate.token_count,
+      }, '[chat-run-socket] full context estimate')
+      return estimate.token_count
+    },
   )
   const bridgeHistory = history
 
@@ -184,7 +288,21 @@ export async function handleBridgeRun(
     })
 
     for await (const chunk of bridge.streamOutput(started.run_id)) {
-      await applyBridgeChunkAsync(nsp, socket, state, session_id, runMarker, chunk, emit, profile, sessionMap, bridge, dequeueNextQueuedRun)
+      await applyBridgeChunkAsync(
+        nsp,
+        socket,
+        state,
+        session_id,
+        runMarker,
+        chunk,
+        emit,
+        profile,
+        sessionMap,
+        bridge,
+        dequeueNextQueuedRun,
+        fullInstructions,
+        { model: resolvedModel, provider: resolvedProvider },
+      )
       if (chunk.done) break
     }
   } catch (err: any) {
@@ -201,14 +319,108 @@ export async function handleBridgeRun(
     flushBridgePendingToDb(state, session_id)
     updateSessionStats(session_id)
     const message = err instanceof Error ? err.message : String(err)
-    emit('run.failed', { event: 'run.failed', error: message, queue_remaining: queueLen })
     const errUsage = await calcAndUpdateUsage(session_id, state, emit)
+    const errContextTokens = await refreshFinalContextUsage({
+      sessionId: session_id,
+      profile,
+      model: resolvedModel,
+      provider: resolvedProvider,
+      instructions: fullInstructions,
+      state,
+      usage: errUsage,
+      emit,
+      bridge,
+    })
     updateUsage(session_id, {
       inputTokens: errUsage.inputTokens,
       outputTokens: errUsage.outputTokens,
-      profile: state.profile,
+      profile,
+    })
+    emit('run.failed', {
+      event: 'run.failed',
+      error: message,
+      inputTokens: errUsage.inputTokens,
+      outputTokens: errUsage.outputTokens,
+      contextTokens: errContextTokens,
+      queue_remaining: queueLen,
     })
     if (queueLen > 0) dequeueNextQueuedRun(socket, session_id)
+  }
+}
+
+async function refreshFinalContextUsage(args: {
+  sessionId: string
+  profile: string
+  model?: string | null
+  provider?: string | null
+  instructions: string
+  state: SessionState
+  usage: { inputTokens: number; outputTokens: number }
+  emit: (event: string, payload: any) => void
+  bridge: AgentBridgeClient
+}): Promise<number | undefined> {
+  try {
+    const dbHistory = await buildDbHistory(args.sessionId, { excludeLastUser: false })
+    const finalHistory = await buildSnapshotAwareHistory(
+      args.sessionId,
+      args.profile,
+      dbHistory,
+      { model: args.model, provider: args.provider },
+    )
+    const finalMessageUsage = estimateUsageTokensFromMessages(finalHistory)
+    const finalMessageTokens = finalMessageUsage.inputTokens + finalMessageUsage.outputTokens
+    if (getCachedBridgeContextOverhead(args.state) != null) {
+      const contextTokens = updateMessageContextTokenUsage(
+        args.sessionId,
+        args.state,
+        args.emit,
+        finalMessageTokens,
+        args.usage,
+      )
+      bridgeLogger.info({
+        sessionId: args.sessionId,
+        profile: args.profile,
+        model: args.model,
+        provider: args.provider,
+        messages: finalHistory.length,
+        fixedContextTokens: args.state.bridgeContext?.fixedContextTokens,
+        messageTokens: finalMessageTokens,
+        fullContextTokens: contextTokens,
+      }, '[chat-run-socket] final cached context estimate')
+      return contextTokens
+    }
+    const estimate = await args.bridge.contextEstimate(
+      args.sessionId,
+      finalHistory,
+      args.instructions,
+      args.profile,
+      { model: args.model ?? undefined, provider: args.provider ?? undefined },
+    )
+    cacheBridgeContext(args.state, estimate)
+    const contextTokens = typeof estimate.token_count === 'number' && Number.isFinite(estimate.token_count) && estimate.token_count > 0
+      ? Math.floor(estimate.token_count)
+      : undefined
+    if (contextTokens == null) return args.state.contextTokens
+
+    updateContextTokenUsage(args.sessionId, args.state, args.emit, contextTokens, args.usage)
+    bridgeLogger.info({
+      sessionId: args.sessionId,
+      profile: args.profile,
+      model: args.model,
+      provider: args.provider,
+      messages: estimate.message_count,
+      toolCount: estimate.tool_count,
+      systemPromptChars: estimate.system_prompt_chars,
+      fullContextTokens: contextTokens,
+    }, '[chat-run-socket] final full context estimate')
+    return contextTokens
+  } catch (err) {
+    bridgeLogger.warn({
+      err: err instanceof Error ? { message: err.message, name: err.name } : err,
+      sessionId: args.sessionId,
+      profile: args.profile,
+    }, '[chat-run-socket] final full context estimate failed')
+    return args.state.contextTokens
   }
 }
 
@@ -224,6 +436,8 @@ async function applyBridgeChunkAsync(
   sessionMap: Map<string, SessionState>,
   bridge: AgentBridgeClient,
   dequeueNextQueuedRun: (socket: Socket, sessionId: string, fallbackProfile?: string) => void,
+  instructions: string,
+  modelContext: { model?: string | null; provider?: string | null },
 ): Promise<void> {
   if (state.activeRunMarker !== runMarker) {
     bridgeLogger.info({
@@ -239,7 +453,17 @@ async function applyBridgeChunkAsync(
 
   for (const ev of chunk.events || []) {
     const evType = ev.event as string | undefined
-    if (evType === 'tool.started') {
+    if (evType === 'bridge.context.ready') {
+      cacheBridgeContext(state, ev)
+      const usage = await calcAndUpdateUsage(sessionId, state, emit)
+      updateMessageContextTokenUsage(
+        sessionId,
+        state,
+        emit,
+        usage.inputTokens + usage.outputTokens,
+        usage,
+      )
+    } else if (evType === 'tool.started') {
       flushBridgePendingToDb(state, sessionId, runMarker)
       const toolName = (ev.tool_name as string) || ''
       const args = ev.args as Record<string, unknown> | undefined
@@ -270,6 +494,38 @@ async function applyBridgeChunkAsync(
       }
       pushState(sessionMap, sessionId, 'tool.completed', payload)
       emit('tool.completed', payload)
+    } else if (evType?.startsWith('subagent.')) {
+      const payload = {
+        event: evType,
+        run_id: chunk.run_id,
+        subagent_id: ev.subagent_id,
+        parent_id: ev.parent_id,
+        depth: ev.depth,
+        task_index: ev.task_index,
+        task_count: ev.task_count,
+        goal: ev.goal,
+        model: ev.model,
+        toolsets: ev.toolsets,
+        tool_count: ev.tool_count,
+        tool: ev.tool_name,
+        name: ev.tool_name,
+        preview: ev.text || ev.summary || ev.tool_preview || '',
+        text: ev.text || '',
+        status: ev.status,
+        summary: ev.summary,
+        duration: ev.duration_seconds,
+        duration_seconds: ev.duration_seconds,
+        input_tokens: ev.input_tokens,
+        output_tokens: ev.output_tokens,
+        reasoning_tokens: ev.reasoning_tokens,
+        api_calls: ev.api_calls,
+        cost_usd: ev.cost_usd,
+        files_read: ev.files_read,
+        files_written: ev.files_written,
+        output_tail: ev.output_tail,
+      }
+      pushState(sessionMap, sessionId, evType, payload)
+      emit(evType, payload)
     } else if (evType === 'turn.boundary') {
       flushBridgePendingToDb(state, sessionId, runMarker)
     } else if (evType === 'reasoning.delta' || evType === 'thinking.delta') {
@@ -315,9 +571,19 @@ async function applyBridgeChunkAsync(
     } else if (evType === 'bridge.compression.requested') {
       const bridgeHistory = await buildDbHistory(sessionId, { excludeLastUser: true })
       const bridgeUsage = estimateUsageTokensFromMessages(bridgeHistory)
-      const tokenCount = bridgeHistory.length > 0
-        ? bridgeUsage.inputTokens + bridgeUsage.outputTokens
-        : ev.approx_tokens
+      const messageOnlyTokens = bridgeUsage.inputTokens + bridgeUsage.outputTokens
+      const tokenCount = typeof ev.approx_tokens === 'number' && Number.isFinite(ev.approx_tokens) && ev.approx_tokens > 0
+        ? ev.approx_tokens
+        : messageOnlyTokens
+      bridgeLogger.info({
+        sessionId,
+        profile,
+        bridgeMessages: ev.message_count,
+        dbMessages: bridgeHistory.length,
+        messageOnlyTokens,
+        fullContextTokens: tokenCount,
+        source: typeof ev.approx_tokens === 'number' ? 'bridge' : 'message-only-fallback',
+      }, '[chat-run-socket] bridge compression token estimate')
       const payload = {
         event: 'compression.started',
         run_id: chunk.run_id,
@@ -334,6 +600,7 @@ async function applyBridgeChunkAsync(
             sessionId,
             profile,
             ev.messages as ChatMessage[],
+            typeof ev.approx_tokens === 'number' ? ev.approx_tokens : undefined,
           )
           state.bridgeCompressionResults = state.bridgeCompressionResults || {}
           state.bridgeCompressionResults[String(ev.request_id)] = compressed
@@ -348,6 +615,11 @@ async function applyBridgeChunkAsync(
       const compressionResult = ev.request_id
         ? state.bridgeCompressionResults?.[String(ev.request_id)]
         : undefined
+      const bridgeAfterContextTokens = finiteToken(ev.result_approx_tokens)
+      const messageAfterTokens = finiteToken(compressionResult?.afterTokens)
+      const afterContextTokens = messageAfterTokens != null && getCachedBridgeContextOverhead(state) != null
+        ? contextTokensWithCachedOverhead(state, messageAfterTokens)
+        : bridgeAfterContextTokens ?? messageAfterTokens
       const payload = {
         event: 'compression.completed',
         run_id: chunk.run_id,
@@ -357,7 +629,8 @@ async function applyBridgeChunkAsync(
         totalMessages: compressionResult?.beforeMessages ?? ev.message_count,
         resultMessages: compressionResult?.resultMessages ?? ev.result_messages,
         beforeTokens: compressionResult?.beforeTokens ?? ev.approx_tokens,
-        afterTokens: compressionResult?.afterTokens,
+        afterTokens: messageAfterTokens ?? bridgeAfterContextTokens,
+        contextTokens: afterContextTokens,
         summaryTokens: compressionResult?.summaryTokens,
         verbatimCount: compressionResult?.verbatimCount,
         compressedStartIndex: compressionResult?.compressedStartIndex,
@@ -368,7 +641,12 @@ async function applyBridgeChunkAsync(
       }
       replaceState(sessionMap, sessionId, 'compression.completed', payload)
       emit('compression.completed', payload)
-      await calcAndUpdateUsage(sessionId, state, emit)
+      const usage = await calcAndUpdateUsage(sessionId, state, emit)
+      if (messageAfterTokens != null && getCachedBridgeContextOverhead(state) != null) {
+        updateMessageContextTokenUsage(sessionId, state, emit, messageAfterTokens, usage)
+      } else {
+        updateContextTokenUsage(sessionId, state, emit, afterContextTokens, usage)
+      }
     } else if (evType === 'bridge.compression.failed') {
       const payload = {
         event: 'compression.completed',
@@ -441,6 +719,17 @@ async function applyBridgeChunkAsync(
   updateSessionStats(sessionId)
   await delay(BRIDGE_USAGE_FLUSH_DELAY_MS)
   const usage = await calcAndUpdateUsage(sessionId, state, emit)
+  const contextTokens = await refreshFinalContextUsage({
+    sessionId,
+    profile,
+    model: modelContext.model,
+    provider: modelContext.provider,
+    instructions,
+    state,
+    usage,
+    emit,
+    bridge,
+  })
   updateUsage(sessionId, {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
@@ -458,15 +747,17 @@ async function applyBridgeChunkAsync(
   state.runId = undefined
   state.activeRunMarker = undefined
   state.events = []
-  const eventName = chunk.status === 'error' ? 'run.failed' : 'run.completed'
+  const terminalError = bridgeTerminalError(chunk)
+  const eventName = terminalError ? 'run.failed' : 'run.completed'
   const payload = {
     event: eventName,
     run_id: chunk.run_id,
     output: chunk.output || state.bridgeOutput || '',
     result: chunk.result,
-    error: chunk.error,
+    error: terminalError || chunk.error,
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
+    contextTokens,
     queue_remaining: state.queue.length,
   }
   emit(eventName, payload)

@@ -90,6 +90,21 @@ export interface AgentBridgeRunResult extends AgentBridgeResponse {
   error?: string | null
 }
 
+export interface AgentBridgeContextEstimate extends AgentBridgeResponse {
+  session_id: string
+  token_count?: number | null
+  fixed_context_tokens?: number | null
+  system_prompt_tokens?: number | null
+  tool_tokens?: number | null
+  message_count: number
+  tool_count: number
+  tool_names?: string[]
+  system_prompt_chars: number
+  profile?: string
+  model?: string
+  provider?: string
+}
+
 export interface AgentBridgeCommandResult extends AgentBridgeResponse {
   session_id: string
   command: string
@@ -372,6 +387,24 @@ export class AgentBridgeClient {
     })
   }
 
+  contextEstimate(
+    sessionId: string,
+    messages: unknown[],
+    instructions?: string,
+    profile?: string,
+    options: Pick<AgentBridgeChatOptions, 'model' | 'provider'> = {},
+  ): Promise<AgentBridgeContextEstimate> {
+    return this.request<AgentBridgeContextEstimate>({
+      action: 'context_estimate',
+      session_id: sessionId,
+      messages,
+      ...(instructions ? { instructions } : {}),
+      ...(profile ? { profile } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.provider ? { provider: options.provider } : {}),
+    })
+  }
+
   command(sessionId: string, command: string): Promise<AgentBridgeCommandResult> {
     return this.request<AgentBridgeCommandResult>({
       action: 'command',
@@ -446,6 +479,10 @@ export class AgentBridgeClient {
 
   approvalRespond(approvalId: string, choice: string): Promise<AgentBridgeResponse> {
     return this.request({ action: 'approval_respond', approval_id: approvalId, choice })
+  }
+
+  clarifyRespond(clarifyId: string, response: string): Promise<AgentBridgeResponse> {
+    return this.request({ action: 'clarify_respond', clarify_id: clarifyId, response })
   }
 
   compressionRespond(
