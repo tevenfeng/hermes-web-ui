@@ -470,6 +470,35 @@ assert prod_worker.endpoint != preview_worker.endpoint
 `)
   })
 
+  it('allows worker transport to be selected with environment variables', () => {
+    runPython(String.raw`
+${harness}
+
+os.environ.pop("HERMES_AGENT_BRIDGE_WORKER_TRANSPORT", None)
+os.environ.pop("HERMES_AGENT_BRIDGE_WORKER_PORT_BASE", None)
+
+default_endpoint = bridge._worker_endpoint("default", "ipc:///tmp/hermes-agent-bridge.sock")
+if os.name == "nt":
+    assert default_endpoint.startswith("tcp://127.0.0.1:")
+else:
+    assert default_endpoint.startswith("ipc://")
+
+os.environ["HERMES_AGENT_BRIDGE_WORKER_TRANSPORT"] = "tcp"
+os.environ["HERMES_AGENT_BRIDGE_WORKER_PORT_BASE"] = "19650"
+tcp_endpoint = bridge._worker_endpoint("default", "ipc:///tmp/hermes-agent-bridge.sock")
+assert tcp_endpoint.startswith("tcp://127.0.0.1:")
+assert int(tcp_endpoint.rsplit(":", 1)[1]) >= 19650
+assert int(tcp_endpoint.rsplit(":", 1)[1]) < 20650
+
+os.environ["HERMES_AGENT_BRIDGE_WORKER_TRANSPORT"] = "ipc"
+ipc_endpoint = bridge._worker_endpoint("default", "ipc:///tmp/hermes-agent-bridge.sock")
+assert ipc_endpoint.startswith("ipc://")
+
+os.environ.pop("HERMES_AGENT_BRIDGE_WORKER_TRANSPORT", None)
+os.environ.pop("HERMES_AGENT_BRIDGE_WORKER_PORT_BASE", None)
+`)
+  })
+
   it('restores approval env and clears handlers when a run fails', () => {
     runPython(String.raw`
 ${harness}
@@ -682,6 +711,51 @@ assert response["ok"] is True, response
 assert captured["endpoint"] == "ipc:///tmp/worker.sock", captured
 assert captured["req"] == {"action": "chat"}, captured
 assert captured["timeout"] == 310, captured
+`)
+  })
+
+  it('awaits MCP server shutdown without holding the MCP registry lock', () => {
+    runPython(String.raw`
+${harness}
+
+import asyncio
+
+lock = threading.Lock()
+servers = {}
+events = []
+
+class FakeMcpTask:
+    async def shutdown(self):
+        events.append("shutdown-started")
+        acquired = lock.acquire(blocking=False)
+        events.append(("lock-free-during-shutdown", acquired))
+        if acquired:
+            lock.release()
+        await asyncio.sleep(0)
+        events.append("shutdown-finished")
+
+task = FakeMcpTask()
+servers["github"] = task
+
+def run_on_mcp_loop(factory, timeout=30):
+    events.append(("timeout", timeout))
+    asyncio.run(factory())
+
+result = bridge.BridgeServer._shutdown_mcp_server(
+    "github",
+    servers,
+    lock,
+    run_on_mcp_loop,
+)
+
+assert result is True, result
+assert "github" not in servers, servers
+assert events == [
+    ("timeout", 15),
+    "shutdown-started",
+    ("lock-free-during-shutdown", True),
+    "shutdown-finished",
+], events
 `)
   })
 })
