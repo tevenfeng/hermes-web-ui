@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   createReadStream,
@@ -14,20 +13,28 @@ import {
 import { get as httpGet } from 'node:http'
 import { get as httpsGet } from 'node:https'
 import { basename, dirname, join, relative } from 'node:path'
-import { promisify } from 'node:util'
 import { app } from 'electron'
 import {
   bundledGit,
   bundledNode,
+  bundledPython,
   desktopRuntimeDir,
   hermesBinExists,
   runtimePlatformKey,
 } from './paths'
+import {
+  hermesAgentVersionFromRuntimeTag,
+  runtimeManifestMatchesHermesAgentVersion,
+} from './runtime-version'
+import { extractTarGzipArchive } from './runtime-archive'
+import { t } from './desktop-i18n'
 
-const execFileAsync = promisify(execFile)
 const DEFAULT_RUNTIME_BASE_URL = 'https://download.ekkolearnai.com'
+const DEFAULT_RUNTIME_GITHUB_REPO = 'EKKOLearnAI/hermes-web-ui'
 const RUNTIME_MANIFEST_NAME = 'runtime-manifest.json'
 const PACKAGED_RUNTIME_RELEASE_NAME = 'runtime-release.json'
+
+export type RuntimeDownloadSource = 'cf' | 'github'
 
 type RuntimeManifest = {
   schema: number
@@ -48,6 +55,11 @@ type RuntimeDescriptor = {
   hermesAgentVersion?: string
 }
 
+type PackagedRuntimeRelease = {
+  tag?: string
+  hermesAgentVersion?: string
+}
+
 export type RuntimeProgress = {
   stage: 'resolve' | 'download' | 'verify' | 'extract' | 'ready'
   message: string
@@ -57,6 +69,13 @@ export type RuntimeProgress = {
 }
 
 type RuntimeProgressHandler = (progress: RuntimeProgress) => void
+
+function runtimeDownloadSource(source?: RuntimeDownloadSource): RuntimeDownloadSource | null {
+  if (source) return source
+  const value = process.env.HERMES_DESKTOP_RUNTIME_SOURCE?.trim().toLowerCase()
+  if (value === 'github' || value === 'cf') return value
+  return null
+}
 
 function requiredRuntimeFiles(root: string): string[] {
   const pythonBin = process.platform === 'win32'
@@ -79,7 +98,11 @@ function missingRuntimeFiles(root: string): string[] {
 
 function runtimeReady(): boolean {
   const gitReady = process.platform !== 'win32' || !!bundledGit()
-  return hermesBinExists() && existsSync(bundledNode()) && gitReady
+  return existsSync(bundledPython()) && hermesBinExists() && existsSync(bundledNode()) && gitReady
+}
+
+export function isDesktopRuntimeReady(): boolean {
+  return runtimeReady()
 }
 
 function releaseTagCandidates(): string[] {
@@ -91,7 +114,7 @@ function releaseTagCandidates(): string[] {
   return Array.from(new Set(candidates.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0)))
 }
 
-function packagedRuntimeReleaseTag(): string | null {
+function packagedRuntimeReleaseMetadata(): PackagedRuntimeRelease | null {
   const candidates = app.isPackaged
     ? [join(process.resourcesPath, 'build', PACKAGED_RUNTIME_RELEASE_NAME)]
     : [join(app.getAppPath(), 'build', PACKAGED_RUNTIME_RELEASE_NAME)]
@@ -99,17 +122,38 @@ function packagedRuntimeReleaseTag(): string | null {
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue
     try {
-      const metadata = JSON.parse(readFileSync(candidate, 'utf-8')) as { tag?: unknown }
-      if (typeof metadata.tag === 'string' && metadata.tag.trim()) return metadata.tag.trim()
+      const metadata = JSON.parse(readFileSync(candidate, 'utf-8')) as { tag?: unknown; hermesAgentVersion?: unknown }
+      return {
+        tag: typeof metadata.tag === 'string' && metadata.tag.trim() ? metadata.tag.trim() : undefined,
+        hermesAgentVersion: typeof metadata.hermesAgentVersion === 'string' && metadata.hermesAgentVersion.trim()
+          ? metadata.hermesAgentVersion.trim()
+          : undefined,
+      }
     } catch {}
   }
 
   return null
 }
 
-function runtimeAssetUrl(assetName: string, tag: string): string {
-  const repo = process.env.HERMES_DESKTOP_RUNTIME_REPO?.trim()
-  if (repo) {
+function packagedRuntimeReleaseTag(): string | null {
+  const metadata = packagedRuntimeReleaseMetadata()
+  if (metadata?.tag) return metadata.tag
+  return null
+}
+
+export function cachedRuntimeNeedsPackagedReleaseUpdate(): boolean {
+  const metadata = packagedRuntimeReleaseMetadata()
+  const expectedVersion = process.env.HERMES_DESKTOP_RUNTIME_RELEASE_TAG
+    ? hermesAgentVersionFromRuntimeTag(process.env.HERMES_DESKTOP_RUNTIME_RELEASE_TAG)
+    : metadata?.hermesAgentVersion || hermesAgentVersionFromRuntimeTag(metadata?.tag)
+  if (!expectedVersion) return false
+  const match = runtimeManifestMatchesHermesAgentVersion(readCachedRuntimeManifest(desktopRuntimeDir()), expectedVersion)
+  return match === false
+}
+
+function runtimeAssetUrl(assetName: string, tag: string, source: RuntimeDownloadSource): string {
+  if (source === 'github') {
+    const repo = process.env.HERMES_DESKTOP_RUNTIME_REPO?.trim() || DEFAULT_RUNTIME_GITHUB_REPO
     if (tag === 'latest') {
       return `https://github.com/${repo}/releases/latest/download/${encodeURIComponent(assetName)}`
     }
@@ -126,35 +170,49 @@ function runtimeAssetUrl(assetName: string, tag: string): string {
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error(`GET ${url} returned ${response.status}`)
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`GET ${url} returned ${response.status}`)
+    }
+    return await response.json() as T
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith(`GET ${url}`)) throw err
+    throw new Error(`GET ${url} failed: ${err instanceof Error ? err.message : String(err)}`)
   }
-  return await response.json() as T
 }
 
-async function resolveRuntimeDescriptor(): Promise<RuntimeDescriptor> {
+async function resolveRuntimeDescriptor(source?: RuntimeDownloadSource): Promise<RuntimeDescriptor> {
   const directUrl = process.env.HERMES_DESKTOP_RUNTIME_URL?.trim()
   if (directUrl) {
     return { name: basename(new URL(directUrl).pathname) || 'hermes-runtime.tar.gz', url: directUrl }
   }
 
+  const downloadSource = runtimeDownloadSource(source)
   const platformManifestName = `hermes-runtime-${runtimePlatformKey()}.json`
   const manifestOverride = process.env.HERMES_DESKTOP_RUNTIME_MANIFEST_URL?.trim()
+  if (!downloadSource && !manifestOverride) {
+    throw new Error('Hermes runtime download source is not selected')
+  }
+
   const candidates = manifestOverride
     ? [{ tag: '', url: manifestOverride }]
-    : releaseTagCandidates().map(tag => ({ tag, url: runtimeAssetUrl(platformManifestName, tag) }))
+    : releaseTagCandidates().map(tag => ({ tag, url: runtimeAssetUrl(platformManifestName, tag, downloadSource!) }))
 
   let lastError: Error | null = null
   for (const candidate of candidates) {
     try {
+      console.log(`[runtime] resolving Hermes runtime from ${downloadSource || 'custom'}: ${candidate.url}`)
       const manifest = await fetchJson<RuntimeManifest>(candidate.url)
       if (!manifest.asset?.name) {
         throw new Error(`runtime manifest is missing asset.name: ${candidate.url}`)
       }
+      if (!manifest.asset.url && !downloadSource) {
+        throw new Error(`runtime manifest is missing asset.url and no download source was selected: ${candidate.url}`)
+      }
       return {
         name: manifest.asset.name,
-        url: manifest.asset.url || runtimeAssetUrl(manifest.asset.name, candidate.tag),
+        url: manifest.asset.url || runtimeAssetUrl(manifest.asset.name, candidate.tag, downloadSource!),
         sha256: manifest.asset.sha256,
         hermesAgentVersion: manifest.hermesAgentVersion,
       }
@@ -212,7 +270,7 @@ function downloadFile(
         receivedBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)
         onProgress?.({
           stage: 'download',
-          message: 'Downloading Hermes runtime...',
+          message: t('runtime.downloading'),
           percent: totalBytes ? Math.min(100, (receivedBytes / totalBytes) * 100) : undefined,
           receivedBytes,
           totalBytes,
@@ -224,7 +282,9 @@ function downloadFile(
       file.on('finish', () => file.close(() => resolve()))
       file.on('error', reject)
     })
-    req.on('error', reject)
+    req.on('error', err => {
+      reject(new Error(`GET ${url} failed: ${err instanceof Error ? err.message : String(err)}`))
+    })
   })
 }
 
@@ -246,9 +306,7 @@ async function extractRuntimeArchive(archive: string, targetRoot: string): Promi
   mkdirSync(tempRoot, { recursive: true })
 
   try {
-    await execFileAsync(process.platform === 'win32' ? 'tar.exe' : 'tar', ['-xzf', archive, '-C', tempRoot], {
-      windowsHide: true,
-    })
+    await extractTarGzipArchive(archive, tempRoot)
     const missing = missingRuntimeFiles(tempRoot)
     if (missing.length > 0) {
       throw new Error(`Runtime archive is missing required files: ${missing.map(file => relative(tempRoot, file)).join(', ')}`)
@@ -262,14 +320,17 @@ async function extractRuntimeArchive(archive: string, targetRoot: string): Promi
   }
 }
 
-export async function ensureDesktopRuntime(onProgress?: RuntimeProgressHandler): Promise<void> {
+export async function ensureDesktopRuntime(
+  onProgress?: RuntimeProgressHandler,
+  source?: RuntimeDownloadSource,
+): Promise<void> {
   const runtimeRoot = desktopRuntimeDir()
   mkdirSync(runtimeRoot, { recursive: true })
 
   let descriptor: RuntimeDescriptor
   try {
-    onProgress?.({ stage: 'resolve', message: 'Checking Hermes runtime...' })
-    descriptor = await resolveRuntimeDescriptor()
+    onProgress?.({ stage: 'resolve', message: t('runtime.checking') })
+    descriptor = await resolveRuntimeDescriptor(source)
   } catch (err) {
     if (runtimeReady() && !process.env.HERMES_DESKTOP_RUNTIME_FORCE_UPDATE) {
       console.warn(`[runtime] using cached Hermes runtime because update check failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -282,20 +343,20 @@ export async function ensureDesktopRuntime(onProgress?: RuntimeProgressHandler):
 
   const archive = join(dirname(runtimeRoot), `${descriptor.name}.download`)
   console.log(`[runtime] downloading Hermes runtime ${descriptor.name}`)
-  onProgress?.({ stage: 'download', message: `Downloading ${descriptor.name}...` })
+  onProgress?.({ stage: 'download', message: t('runtime.downloadingPackage', { name: descriptor.name }) })
   let archiveSize = 0
   try {
     await downloadFile(descriptor.url, archive, onProgress)
     archiveSize = statSync(archive).size
     if (descriptor.sha256) {
-      onProgress?.({ stage: 'verify', message: 'Verifying Hermes runtime...' })
+      onProgress?.({ stage: 'verify', message: t('runtime.verifying') })
       const actual = await sha256File(archive)
       if (actual !== descriptor.sha256) {
         throw new Error(`Runtime checksum mismatch for ${descriptor.name}`)
       }
     }
 
-    onProgress?.({ stage: 'extract', message: 'Extracting Hermes runtime...' })
+    onProgress?.({ stage: 'extract', message: t('runtime.extracting') })
     await extractRuntimeArchive(archive, runtimeRoot)
   } finally {
     rmSync(archive, { force: true })
@@ -314,6 +375,6 @@ export async function ensureDesktopRuntime(onProgress?: RuntimeProgressHandler):
       },
     }, null, 2))
   }
-  onProgress?.({ stage: 'ready', message: 'Hermes runtime ready.' })
+  onProgress?.({ stage: 'ready', message: t('runtime.ready') })
   console.log(`[runtime] Hermes runtime ready at ${runtimeRoot}`)
 }
