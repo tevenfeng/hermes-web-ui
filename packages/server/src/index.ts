@@ -26,6 +26,7 @@ import { refreshConfiguredProviderModelCatalogsInBackground } from './services/h
 import { scanLanDevices, startLanDiscoveryResponder } from './services/lan-discovery'
 import { getLanPeerSocketManager, getLanPeerSocketPath } from './services/lan-peer-socket'
 import { logger } from './services/logger'
+import { createStaticCompressionMiddleware } from './middleware/static-compression'
 import { requireUserJwt, resolveUserProfile } from './middleware/user-auth'
 import { createCorsOriginResolver, securityHeaders } from './security'
 
@@ -107,13 +108,12 @@ async function startRuntimeServicesBeforeListen(): Promise<void> {
   if (gatewayAutostartDisabled()) {
     console.log('[bootstrap] profile gateway check disabled by HERMES_WEB_UI_DISABLE_GATEWAY_AUTOSTART')
   } else {
-    try {
-      await ensureProfileGatewaysRunning()
-      console.log('[bootstrap] profile gateways checked')
-    } catch (err) {
-      logger.warn(err, '[bootstrap] failed to ensure profile gateways')
-      console.warn('[bootstrap] failed to ensure profile gateways:', err instanceof Error ? err.message : err)
-    }
+    void ensureProfileGatewaysRunning()
+      .then(() => console.log('[bootstrap] profile gateways checked'))
+      .catch((err) => {
+        logger.warn(err, '[bootstrap] failed to ensure profile gateways')
+        console.warn('[bootstrap] failed to ensure profile gateways:', err instanceof Error ? err.message : err)
+      })
   }
 
   try {
@@ -226,7 +226,13 @@ export async function bootstrap() {
   app.use(cors({ origin: createCorsOriginResolver(config.corsOrigins) }))
   // Raise body limits above the default 1mb: profile avatars and MiMo voice-clone
   // reference audio are posted as base64 data URLs before reaching handlers.
-  app.use(bodyParser({ encoding: 'utf-8', jsonLimit: '20mb', formLimit: '20mb', textLimit: '20mb' }))
+  app.use(bodyParser({
+    encoding: 'utf-8',
+    jsonLimit: '20mb',
+    formLimit: '20mb',
+    textLimit: '20mb',
+    parsedMethods: ['POST', 'PUT', 'PATCH', 'DELETE'],
+  }))
   console.log('[bootstrap] cors + bodyParser registered')
 
   // Register all routes (handles auth internally)
@@ -236,6 +242,7 @@ export async function bootstrap() {
 
   // SPA fallback
   const distDir = resolve(__dirname, '..', 'client')
+  app.use(createStaticCompressionMiddleware())
   app.use(serve(distDir))
   app.use(async (ctx) => {
     if (!ctx.path.startsWith('/api') &&

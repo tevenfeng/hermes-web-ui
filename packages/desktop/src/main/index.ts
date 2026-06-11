@@ -1,7 +1,8 @@
-import { app, BrowserWindow, Menu, Tray, shell, ipcMain, nativeImage } from 'electron'
+import { app, BrowserWindow, Menu, Tray, shell, ipcMain, nativeImage, Notification } from 'electron'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { startWebUiServer, stopWebUiServer, getToken } from './webui-server'
-import { bundledNode, desktopIcon, desktopTrayTemplateIcon, desktopWindowsTrayIcon, hermesBinExists, hermesBin, webuiDir } from './paths'
+import { bundledNode, desktopIcon, desktopRuntimeVersion, desktopTrayTemplateIcon, desktopWindowsTrayIcon, hermesBinExists, hermesBin, webuiDir } from './paths'
 import { checkForDesktopUpdates, initAutoUpdater } from './updater'
 import { t } from './desktop-i18n'
 import { installHermesStudioCliShim, installHermesStudioMcpShim } from './cli-shim'
@@ -10,6 +11,8 @@ import {
   cachedRuntimeNeedsPackagedReleaseUpdate,
   ensureDesktopRuntime,
   isDesktopRuntimeReady,
+  migrateLegacyDesktopRuntime,
+  writeActiveRuntimeVersion,
   type RuntimeDownloadSource,
   type RuntimeProgress,
 } from './runtime-manager'
@@ -17,6 +20,8 @@ import {
 const PORT = Number(process.env.HERMES_DESKTOP_PORT) || 8748
 const START_HIDDEN = process.argv.includes('--hidden')
 const QUIT_EXISTING = process.argv.includes('--quit')
+const APP_USER_MODEL_ID = 'com.hermeswebui.studio'
+type WindowControlAction = 'minimize' | 'toggle-maximize' | 'close'
 
 let mainWindow: BrowserWindow | null = null
 let serverUrl: string | null = null
@@ -24,6 +29,11 @@ let tray: Tray | null = null
 let isQuitting = false
 let isBootstrapping = false
 let windowFadeTimer: NodeJS.Timeout | null = null
+const activeNotifications = new Set<Notification>()
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId(APP_USER_MODEL_ID)
+}
 
 function cancelWindowFade() {
   if (windowFadeTimer) {
@@ -74,6 +84,31 @@ function showMainWindow() {
 function quitApp() {
   isQuitting = true
   app.quit()
+}
+
+function windowState() {
+  return {
+    isMaximized: !!mainWindow?.isMaximized(),
+  }
+}
+
+function handleWindowControl(action: WindowControlAction) {
+  if (!mainWindow || mainWindow.isDestroyed()) return windowState()
+  if (action === 'minimize') {
+    mainWindow.minimize()
+  } else if (action === 'toggle-maximize') {
+    if (mainWindow.isMaximized()) mainWindow.unmaximize()
+    else mainWindow.maximize()
+  } else if (action === 'close') {
+    mainWindow.close()
+  }
+  return windowState()
+}
+
+function hasQuitRequest(data: unknown): boolean {
+  return typeof data === 'object'
+    && data !== null
+    && (data as { quit?: unknown }).quit === true
 }
 
 function loginItemOptions() {
@@ -170,6 +205,14 @@ function createWindow() {
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
     show: false,
+    ...(process.platform === 'darwin'
+      ? {
+          titleBarStyle: 'hiddenInset' as const,
+          trafficLightPosition: { x: 16, y: 12 },
+        }
+      : {
+          frame: false,
+        }),
     ...(process.platform === 'linux' ? { icon: desktopIcon() } : {}),
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'index.js'),
@@ -356,13 +399,15 @@ async function bootstrap(source?: RuntimeDownloadSource) {
 
   try {
     const selectedSource = source || envRuntimeDownloadSource()
+    const migration = migrateLegacyDesktopRuntime(updateSplash)
+    const migrationFailed = migration.status === 'failed'
     const runtimeUrlOverride = !!process.env.HERMES_DESKTOP_RUNTIME_URL?.trim()
     const manifestOverride = !!process.env.HERMES_DESKTOP_RUNTIME_MANIFEST_URL?.trim()
     const forceUpdate = !!process.env.HERMES_DESKTOP_RUNTIME_FORCE_UPDATE
     const runtimeReady = isDesktopRuntimeReady()
     const packagedRuntimeUpdate = app.isPackaged && runtimeReady && cachedRuntimeNeedsPackagedReleaseUpdate()
     const shouldCheckRuntime = !runtimeReady || forceUpdate || runtimeUrlOverride || manifestOverride || packagedRuntimeUpdate
-    const runtimeSource = selectedSource || (packagedRuntimeUpdate ? 'cf' : undefined)
+    const runtimeSource = selectedSource || (!runtimeReady || packagedRuntimeUpdate || migrationFailed ? 'cf' : undefined)
 
     if (shouldCheckRuntime) {
       if (!runtimeSource && !runtimeUrlOverride && !manifestOverride) {
@@ -370,7 +415,10 @@ async function bootstrap(source?: RuntimeDownloadSource) {
         isBootstrapping = false
         return
       }
-      await ensureDesktopRuntime(updateSplash, runtimeSource)
+      await ensureDesktopRuntime(updateSplash, runtimeSource, true)
+    }
+    if (isDesktopRuntimeReady()) {
+      writeActiveRuntimeVersion()
     }
   } catch (err) {
     console.error('Failed to prepare Hermes runtime:', err)
@@ -407,6 +455,59 @@ async function bootstrap(source?: RuntimeDownloadSource) {
 }
 
 ipcMain.handle('hermes-desktop:get-token', () => getToken())
+ipcMain.handle('hermes-desktop:get-window-state', () => windowState())
+ipcMain.handle('hermes-desktop:window-control', (_event, action?: unknown) => {
+  if (action !== 'minimize' && action !== 'toggle-maximize' && action !== 'close') return windowState()
+  return handleWindowControl(action)
+})
+function resolveNotificationIcon(icon: unknown): string {
+  if (typeof icon !== 'string') return desktopIcon()
+  const normalized = icon.trim().replace(/^\/+/, '')
+  if (!normalized || normalized.includes('..')) return desktopIcon()
+
+  const candidates = [
+    join(webuiDir(), 'dist', 'client', normalized),
+    join(webuiDir(), 'dist', normalized),
+    join(webuiDir(), 'packages', 'client', 'public', normalized),
+    join(webuiDir(), normalized),
+  ]
+  return candidates.find(candidate => existsSync(candidate)) || desktopIcon()
+}
+
+ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: unknown; body?: unknown; icon?: unknown; tag?: unknown }) => {
+  const supported = Notification.isSupported()
+  if (!supported) {
+    console.warn('[desktop-notification] Electron notifications are not supported on this system')
+    return false
+  }
+
+  const title = typeof payload?.title === 'string' && payload.title.trim()
+    ? payload.title.trim()
+    : 'Hermes Studio'
+  const body = typeof payload?.body === 'string' ? payload.body.trim().slice(0, 240) : ''
+  const icon = resolveNotificationIcon(payload?.icon)
+  const notification = new Notification({
+    title,
+    body,
+    icon,
+    silent: false,
+  })
+  activeNotifications.add(notification)
+  const releaseNotification = () => {
+    activeNotifications.delete(notification)
+  }
+  notification.on('click', () => {
+    releaseNotification()
+    showMainWindow()
+  })
+  notification.on('close', releaseNotification)
+  notification.on('failed', (_event, error) => {
+    console.warn('[desktop-notification] notification failed', error)
+    releaseNotification()
+  })
+  notification.show()
+  return true
+})
 ipcMain.handle('hermes-desktop:retry-bootstrap', async (_event, source?: RuntimeDownloadSource) => {
   if (serverUrl) {
     await mainWindow?.loadURL(serverUrl)
@@ -418,14 +519,14 @@ ipcMain.handle('hermes-desktop:retry-bootstrap', async (_event, source?: Runtime
 })
 
 function runDesktopApp() {
-  const gotLock = app.requestSingleInstanceLock()
+  const gotLock = app.requestSingleInstanceLock(QUIT_EXISTING ? { quit: true } : undefined)
   if (!gotLock) {
     app.quit()
     return
   }
 
-  app.on('second-instance', (_event, argv) => {
-    if (argv.includes('--quit')) {
+  app.on('second-instance', (_event, argv, _workingDirectory, additionalData) => {
+    if (argv.includes('--quit') || hasQuitRequest(additionalData)) {
       quitApp()
       return
     }
@@ -444,7 +545,7 @@ function runDesktopApp() {
     // default is fine there.
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
     if (app.isPackaged) {
-      installHermesStudioCliShim().then(result => {
+      installHermesStudioCliShim({ runtimeVersion: desktopRuntimeVersion() }).then(result => {
         if (result.status === 'skipped') {
           console.warn(`[cli-shim] ${result.reason}: ${result.shimPath}`)
         }
