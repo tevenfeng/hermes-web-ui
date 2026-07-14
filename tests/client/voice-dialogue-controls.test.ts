@@ -77,6 +77,7 @@ vi.mock('naive-ui', () => ({
   NButton: { template: '<button type="button" v-bind="$attrs"><slot /><slot name="icon" /></button>' },
   NTooltip: { template: '<div><slot name="trigger" /><slot /></div>' },
   NSwitch: { template: '<button type="button"></button>' },
+  NDropdown: { name: 'NDropdown', props: ['options'], emits: ['select'], template: '<div><slot /></div>' },
   NModal: { template: '<div><slot /><slot name="footer" /></div>' },
   NInputNumber: { template: '<input />' },
   NPopselect: { template: '<div><slot /></div>' },
@@ -404,6 +405,22 @@ describe('VoiceDialogueControls', () => {
     expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
   })
 
+  it('opens realtime voice from voice mode in input settings without replacing the STT microphone', async () => {
+    const { wrapper } = mountChatInput()
+    await flushPromises()
+
+    const dropdown = wrapper.getComponent({ name: 'NDropdown' })
+    const options = dropdown.props('options') as Array<{ key: string; label: string }>
+    expect(options.map(option => option.key)).toContain('voiceMode')
+    expect(options.map(option => option.key)).not.toContain('autoPlaySpeech')
+
+    dropdown.vm.$emit('select', 'voiceMode')
+    await flushPromises()
+
+    expect(wrapper.emitted('voiceClick')).toHaveLength(1)
+    expect(micStartMock).not.toHaveBeenCalled()
+  })
+
   it('keeps voice event debug diagnostics hidden in the normal ChatInput path', async () => {
     const { wrapper } = mountChatInput()
     await flushPromises()
@@ -565,6 +582,27 @@ describe('VoiceDialogueControls', () => {
     })
     expect(chatStore.sendMessage).not.toHaveBeenCalled()
     expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('hello hermes')
+  })
+
+  it('uses Doubao as a server-backed STT provider without client-side credentials', async () => {
+    const audio = new Blob(['captured audio'], { type: 'audio/webm' })
+    micStopMock.mockResolvedValueOnce(audio)
+
+    const { useSttSettings } = await import('../../packages/client/src/composables/useSttSettings')
+    useSttSettings().setProvider('doubao')
+
+    const { wrapper } = mountChatInput()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="voice-record-toggle"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="voice-record-toggle"]').trigger('click')
+    await flushPromises()
+
+    expect(transcribeSpeechMock).toHaveBeenCalledWith({
+      audio,
+      provider: 'doubao',
+    })
   })
 
   it('uses browser speech recognition when the browser provider is selected and stages the transcript', async () => {

@@ -68,7 +68,20 @@ export const useModelsStore = defineStore('models', () => {
     defaultModel.value = modelId
     defaultProvider.value = provider
     const appStore = useAppStore()
-    appStore.reloadModels()
+    await appStore.reloadModels()
+  }
+
+  async function setDefaultProvider(providerId: string) {
+    const group = providers.value.find(entry => entry.provider === providerId)
+    if (!group || group.models.length === 0) {
+      throw new Error('Provider has no available models')
+    }
+
+    const nextModel = group.models.includes(defaultModel.value)
+      ? defaultModel.value
+      : group.models[0]
+
+    await setDefaultModel(nextModel, providerId)
   }
 
   async function addProvider(data: CustomProvider) {
@@ -77,8 +90,8 @@ export const useModelsStore = defineStore('models', () => {
     await useAppStore().reloadModels()
   }
 
-  async function removeProvider(name: string) {
-    await systemApi.removeCustomProvider(name)
+  async function removeProvider(name: string, options: { source?: 'custom_providers' | 'providers'; providerKey?: string } = {}) {
+    await systemApi.removeCustomProvider(name, options)
     await fetchProviders()
     await useAppStore().reloadModels()
   }
@@ -96,6 +109,7 @@ export const useModelsStore = defineStore('models', () => {
     fetchProviders,
     refreshModelCache,
     setDefaultModel,
+    setDefaultProvider,
     addProvider,
     removeProvider,
   }

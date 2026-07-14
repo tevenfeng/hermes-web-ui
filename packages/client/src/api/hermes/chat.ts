@@ -1,5 +1,7 @@
 import { io, type Socket } from 'socket.io-client'
 import { getBaseUrlValue, getApiKey } from '../client'
+import type { ChatCodingAgentId } from '../coding-agents'
+import type { ProviderApiMode } from './system'
 
 export type ContentBlock =
   | { type: 'text'; text: string }
@@ -20,17 +22,20 @@ export interface StartRunRequest {
   provider?: string
   model_groups?: Array<{ provider: string; models: string[] }>
   queue_id?: string
-  source?: 'api_server' | 'cli' | 'coding_agent'
-  coding_agent_id?: 'claude-code' | 'codex'
-  agent_id?: 'claude-code' | 'codex'
+  source?: 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow'
+  session_source?: 'global_agent' | 'workflow'
+  coding_agent_id?: ChatCodingAgentId
+  agent_id?: ChatCodingAgentId
   mode?: 'scoped' | 'global'
   workspace?: string | null
   baseUrl?: string
   base_url?: string
   apiKey?: string
   api_key?: string
-  apiMode?: 'chat_completions' | 'codex_responses' | 'anthropic_messages'
-  api_mode?: 'chat_completions' | 'codex_responses' | 'anthropic_messages'
+  apiMode?: ProviderApiMode
+  api_mode?: ProviderApiMode
+  mcpServers?: Record<string, unknown>
+  mcp_servers?: Record<string, unknown>
   /** Per-session reasoning effort override.
    * Empty/undefined = use config.yaml default. */
   reasoning_effort?: string
@@ -48,6 +53,17 @@ export interface RunEvent {
   delta?: string
   /** Payload text for `reasoning.delta` / `thinking.delta` / `reasoning.available` events. */
   text?: string
+  /** MoA reference metadata forwarded as display-only reasoning. */
+  label?: string
+  index?: number
+  count?: number
+  aggregator?: string
+  preset?: string
+  moa?: {
+    preset?: string
+    reference_models?: string[]
+    aggregator?: string
+  }
   tool?: string
   name?: string
   preview?: string
@@ -56,6 +72,10 @@ export interface RunEvent {
   /** Final response text on `run.completed`. May be empty/null if the agent
    * silently swallowed an upstream error — see chat store for fallback. */
   output?: string | null
+  /** Run-level workspace diff summary attached to terminal run events. */
+  workspace_run_change?: unknown
+  /** Provider/runtime context returned by Ekko Agent for follow-up runs. */
+  context?: unknown
   usage?: {
     input_tokens: number
     output_tokens: number
@@ -65,6 +85,8 @@ export interface RunEvent {
   session_id?: string
   /** Generated session title from session.title.updated. */
   title?: string
+  /** Session workspace from session.workspace.updated. */
+  workspace?: string | null
   /** Queue length from run.queued event */
   queue_length?: number
   /** Queue item that was just removed because it is starting now. */
@@ -100,6 +122,7 @@ export interface ResumeSessionPayload {
   inputTokens?: number
   outputTokens?: number
   contextTokens?: number
+  workspace?: string | null
   queueLength?: number
   queueMessages?: RunEvent['queued_messages']
 }
@@ -111,6 +134,8 @@ export interface ResumeSessionPayload {
 let chatRunSocket: Socket | null = null
 let globalListenersRegistered = false
 let chatRunSocketProfile: string | null = null
+export type ChatRunTransport = 'chat-run' | 'global-agent'
+let chatRunSocketTransport: ChatRunTransport = 'chat-run'
 
 const TRANSIENT_DISCONNECT_REASONS = new Set<string>([
   'transport close',
@@ -129,6 +154,7 @@ const sessionEventHandlers = new Map<string, {
   onReasoningAvailable: (event: RunEvent) => void
   onToolStarted: (event: RunEvent) => void
   onToolCompleted: (event: RunEvent) => void
+  onWorkspaceDiffCompleted?: (event: RunEvent) => void
   onSubagentEvent?: (event: RunEvent) => void
   onRunStarted: (event: RunEvent) => void
   onRunCompleted: (event: RunEvent) => void
@@ -142,6 +168,7 @@ const sessionEventHandlers = new Map<string, {
   onAgentEvent?: (event: RunEvent) => void
   onSessionCommand?: (event: RunEvent) => void
   onSessionTitleUpdated?: (event: RunEvent) => void
+  onSessionWorkspaceUpdated?: (event: RunEvent) => void
   onRunQueued?: (event: RunEvent) => void
   onApprovalRequested?: (event: RunEvent) => void
   onApprovalResolved?: (event: RunEvent) => void
@@ -153,6 +180,7 @@ const sessionEventHandlers = new Map<string, {
 const peerUserMessageHandlers = new Set<(event: RunEvent) => void>()
 const sessionCommandHandlers = new Set<(event: RunEvent) => void>()
 const sessionTitleUpdatedHandlers = new Set<(event: RunEvent) => void>()
+const sessionWorkspaceUpdatedHandlers = new Set<(event: RunEvent) => void>()
 
 /**
  * Global message.delta event handler
@@ -230,6 +258,16 @@ function globalToolCompletedHandler(event: RunEvent): void {
   const handlers = sessionEventHandlers.get(sid)
   if (handlers?.onToolCompleted) {
     handlers.onToolCompleted(event)
+  }
+}
+
+function globalWorkspaceDiffCompletedHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  const handlers = sessionEventHandlers.get(sid)
+  if (handlers?.onWorkspaceDiffCompleted) {
+    handlers.onWorkspaceDiffCompleted(event)
   }
 }
 
@@ -414,6 +452,20 @@ function globalSessionTitleUpdatedHandler(event: RunEvent): void {
   }
 }
 
+function globalSessionWorkspaceUpdatedHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  const handlers = sessionEventHandlers.get(sid)
+  if (handlers) {
+    handlers.onSessionWorkspaceUpdated?.(event)
+  }
+
+  for (const handler of sessionWorkspaceUpdatedHandlers) {
+    handler(event)
+  }
+}
+
 function globalAgentEventHandler(event: RunEvent): void {
   const sid = event.session_id
   if (!sid) return
@@ -503,6 +555,7 @@ export function registerSessionHandlers(
     onReasoningAvailable: (event: RunEvent) => void
     onToolStarted: (event: RunEvent) => void
     onToolCompleted: (event: RunEvent) => void
+    onWorkspaceDiffCompleted?: (event: RunEvent) => void
     onSubagentEvent?: (event: RunEvent) => void
     onRunStarted: (event: RunEvent) => void
     onRunCompleted: (event: RunEvent) => void
@@ -516,6 +569,7 @@ export function registerSessionHandlers(
     onAgentEvent?: (event: RunEvent) => void
     onSessionCommand?: (event: RunEvent) => void
     onSessionTitleUpdated?: (event: RunEvent) => void
+    onSessionWorkspaceUpdated?: (event: RunEvent) => void
     onRunQueued?: (event: RunEvent) => void
     onApprovalRequested?: (event: RunEvent) => void
     onApprovalResolved?: (event: RunEvent) => void
@@ -561,12 +615,20 @@ export function onSessionTitleUpdated(handler: (event: RunEvent) => void): () =>
   }
 }
 
+export function onSessionWorkspaceUpdated(handler: (event: RunEvent) => void): () => void {
+  sessionWorkspaceUpdatedHandlers.add(handler)
+  return () => {
+    sessionWorkspaceUpdatedHandlers.delete(handler)
+  }
+}
+
 export function respondClarify(
   sessionId: string,
   clarifyId: string,
   response: string,
+  transport: ChatRunTransport = 'chat-run',
 ): void {
-  const socket = connectChatRun()
+  const socket = connectChatRun(null, transport)
   socket.emit('clarify.respond', {
     session_id: sessionId,
     clarify_id: clarifyId,
@@ -578,8 +640,9 @@ export function respondToolApproval(
   sessionId: string,
   approvalId: string,
   choice: 'once' | 'session' | 'always' | 'deny',
+  transport: ChatRunTransport = 'chat-run',
 ): void {
-  const socket = connectChatRun()
+  const socket = connectChatRun(null, transport)
   socket.emit('approval.respond', {
     session_id: sessionId,
     approval_id: approvalId,
@@ -587,13 +650,18 @@ export function respondToolApproval(
   })
 }
 
-export function getChatRunSocket(): Socket | null {
+export function getChatRunSocket(transport?: ChatRunTransport): Socket | null {
+  if (transport && chatRunSocketTransport !== transport) return null
   return chatRunSocket
 }
 
-export function connectChatRun(requestedProfile?: string | null): Socket {
+export function connectChatRun(requestedProfile?: string | null, transport: ChatRunTransport = 'chat-run'): Socket {
   const normalizedRequestedProfile = requestedProfile?.trim() || null
-  if (chatRunSocket?.connected && (!normalizedRequestedProfile || chatRunSocketProfile === normalizedRequestedProfile)) {
+  if (
+    chatRunSocket?.connected &&
+    chatRunSocketTransport === transport &&
+    (!normalizedRequestedProfile || chatRunSocketProfile === normalizedRequestedProfile)
+  ) {
     return chatRunSocket
   }
 
@@ -621,8 +689,10 @@ export function connectChatRun(requestedProfile?: string | null): Socket {
     profile = normalizedRequestedProfile || localStorage.getItem('hermes_active_profile_name') || 'default'
   }
   chatRunSocketProfile = profile
+  chatRunSocketTransport = transport
 
-  chatRunSocket = io(`${baseUrl}/chat-run`, {
+  const namespace = transport === 'global-agent' ? '/global-agent' : '/chat-run'
+  chatRunSocket = io(`${baseUrl}${namespace}`, {
     auth: { token },
     query: { profile },
     transports: ['websocket', 'polling'],
@@ -641,10 +711,14 @@ export function connectChatRun(requestedProfile?: string | null): Socket {
     chatRunSocket.on('reasoning.delta', globalReasoningDeltaHandler)
     chatRunSocket.on('thinking.delta', globalThinkingDeltaHandler)
     chatRunSocket.on('reasoning.available', globalReasoningAvailableHandler)
+    chatRunSocket.on('moa.reference', globalReasoningDeltaHandler)
+    chatRunSocket.on('moa.aggregating', globalAgentEventHandler)
 
     // Tool events
     chatRunSocket.on('tool.started', globalToolStartedHandler)
     chatRunSocket.on('tool.completed', globalToolCompletedHandler)
+    chatRunSocket.on('tool.failed', globalToolCompletedHandler)
+    chatRunSocket.on('workspace.diff.completed', globalWorkspaceDiffCompletedHandler)
     chatRunSocket.on('subagent.start', globalSubagentEventHandler)
     chatRunSocket.on('subagent.tool', globalSubagentEventHandler)
     chatRunSocket.on('subagent.progress', globalSubagentEventHandler)
@@ -674,6 +748,7 @@ export function connectChatRun(requestedProfile?: string | null): Socket {
     chatRunSocket.on('run.reattach_failed', globalRunReattachFailedHandler)
     chatRunSocket.on('session.command', globalSessionCommandHandler)
     chatRunSocket.on('session.title.updated', globalSessionTitleUpdatedHandler)
+    chatRunSocket.on('session.workspace.updated', globalSessionWorkspaceUpdatedHandler)
 
     globalListenersRegistered = true
   }
@@ -686,6 +761,7 @@ export function disconnectChatRun(): void {
     chatRunSocket.disconnect()
     chatRunSocket = null
     chatRunSocketProfile = null
+    chatRunSocketTransport = 'chat-run'
     globalListenersRegistered = false
     sessionEventHandlers.clear()
   }
@@ -714,8 +790,9 @@ export function resumeSession(
   sessionId: string,
   onResumed: (data: ResumeSessionPayload) => void,
   profile?: string | null,
+  transport: ChatRunTransport = 'chat-run',
 ): Socket {
-  const socket = connectChatRun(profile)
+  const socket = connectChatRun(profile, transport)
 
   const handleResumed = (data: ResumeSessionPayload) => {
     if (data?.session_id !== sessionId) return
@@ -736,6 +813,7 @@ export function startRunViaSocket(
   onStarted?: (runId: string) => void,
   options?: {
     onReconnectResume?: (data: ResumeSessionPayload) => void
+    transport?: ChatRunTransport
   },
 ): { abort: () => void } {
   const sid = body.session_id
@@ -744,7 +822,7 @@ export function startRunViaSocket(
   }
 
   let closed = false
-  const socket = connectChatRun(body.profile)
+  const socket = connectChatRun(body.profile, options?.transport)
   if (sessionEventHandlers.has(sid)) {
     socket.emit('run', body)
     return {
@@ -839,6 +917,10 @@ export function startRunViaSocket(
       onEvent(evt)
     },
     onToolCompleted: (evt: RunEvent) => {
+      if (closed) return
+      onEvent(evt)
+    },
+    onWorkspaceDiffCompleted: (evt: RunEvent) => {
       if (closed) return
       onEvent(evt)
     },

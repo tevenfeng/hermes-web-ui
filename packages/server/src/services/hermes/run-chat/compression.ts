@@ -9,6 +9,7 @@ import {
 } from '../../../db/hermes/session-store'
 import { getCompressionSnapshot } from '../../../db/hermes/compression-snapshot'
 import { ChatContextCompressor, SUMMARY_PREFIX } from '../../../lib/context-compressor'
+import { truncateToolResultForContext } from '../../../lib/tool-result-context'
 import { getModelContextLength } from '../model-context'
 import { readConfigYamlForProfile } from '../../config-helpers'
 import { logger } from '../../logger'
@@ -194,8 +195,11 @@ export async function buildDbHistory(
     : validMessages
 
   return sourceMessages.map((m, idx, arr) => {
-    const msg: any = { role: m.role, content: m.content || '' }
-    if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
+    const content = m.role === 'tool'
+      ? truncateToolResultForContext(m.content || '')
+      : m.content || ''
+    const msg: any = { role: m.role, content }
+    if (m.reasoning_content != null) msg.reasoning_content = m.reasoning_content
     if (m.tool_calls?.length) {
       const cleanedToolCalls = m.tool_calls
         .filter((tc: any) => tc.id && tc.id.length > 0)
@@ -262,7 +266,9 @@ export async function buildCompressedHistory(
       return history
     }
     const cState = getOrCreateSession(sessionMap, sessionId)
-    const assembledTokens = await calcAndUpdateUsage(sessionId, cState, emit)
+    const assembledTokens = await calcAndUpdateUsage(sessionId, cState, emit, {
+      truncateToolResultsForContext: true,
+    })
     const currentRunInputTokens = typeof currentInputTokens === 'number' && Number.isFinite(currentInputTokens) && currentInputTokens > 0
       ? Math.floor(currentInputTokens)
       : 0
@@ -286,7 +292,9 @@ export async function buildCompressedHistory(
         contextTokens,
       })
     }
-    const messageOnlyTotalTokens = assembledTokens.inputTokens + assembledTokens.outputTokens
+    const messageOnlyTotalTokens =
+      (assembledTokens.contextInputTokens ?? assembledTokens.inputTokens) +
+      (assembledTokens.contextOutputTokens ?? assembledTokens.outputTokens)
     let totalTokens = messageOnlyTotalTokens
 
     if (history.length === 0) {
@@ -429,8 +437,12 @@ export async function compressHistory(
       provider: summarizerModelContext.provider,
       workerKey: `${summarizerProfile}:compression:${sessionId}`,
     })
-    const afterTokens = await calcAndUpdateUsage(sessionId, cState, emit)
-    const compressedAfterTokens = afterTokens.inputTokens + afterTokens.outputTokens
+    const afterTokens = await calcAndUpdateUsage(sessionId, cState, emit, {
+      truncateToolResultsForContext: true,
+    })
+    const compressedAfterTokens =
+      (afterTokens.contextInputTokens ?? afterTokens.inputTokens) +
+      (afterTokens.contextOutputTokens ?? afterTokens.outputTokens)
     const resultUsage = estimateUsageTokensFromMessages(result.messages)
     const resultMessageTokens = resultUsage.inputTokens + resultUsage.outputTokens
     const compressedRunMessageTokens = Math.max(
@@ -460,7 +472,7 @@ export async function compressHistory(
 
     const compressed = result.messages.map(m => {
       const msg: any = { role: m.role, content: m.content, tool_call_id: m.tool_call_id, name: m.name }
-      if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
+      if (m.reasoning_content != null) msg.reasoning_content = m.reasoning_content
       if (m.tool_calls?.length) {
         const cleanedToolCalls = m.tool_calls
           .filter((tc: any) => tc.id && tc.id.length > 0)
@@ -548,7 +560,7 @@ export async function forceCompressBridgeHistory(
   })
   const compressedMessages = result.messages.map(m => {
     const msg: any = { role: m.role, content: m.content }
-    if (m.reasoning_content) msg.reasoning_content = m.reasoning_content
+    if (m.reasoning_content != null) msg.reasoning_content = m.reasoning_content
     if (m.tool_calls?.length) {
       const cleanedToolCalls = m.tool_calls
         .filter((tc: any) => tc.id && tc.id.length > 0)

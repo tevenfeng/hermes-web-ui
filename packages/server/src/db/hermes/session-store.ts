@@ -5,6 +5,7 @@
 import { isSqliteAvailable, getDb } from '../index'
 import { SESSIONS_TABLE, MESSAGES_TABLE } from './schemas'
 import { normalizeMessageContentForStorageRole } from './message-content'
+import { copyCompressionSnapshot } from './compression-snapshot'
 
 // Re-export types for compatibility with sessions-db.ts consumers
 export interface HermesSessionRow {
@@ -18,7 +19,10 @@ export interface HermesSessionRow {
   user_id: string | null
   model: string
   provider: string
+  api_mode: string
   title: string | null
+  parent_session_id: string | null
+  fork_point_message_id: string | null
   started_at: number
   ended_at: number | null
   end_reason: string | null
@@ -35,7 +39,11 @@ export interface HermesSessionRow {
   cost_status: string
   preview: string
   last_active: number
+  is_archived: number
   workspace: string | null
+  parent_title?: string | null
+  parent_last_message?: string | null
+  parent_last_message_role?: string | null
 }
 
 export interface HermesMessageRow {
@@ -98,7 +106,10 @@ function mapSessionRow(row: Record<string, unknown>): HermesSessionRow {
     user_id: row.user_id != null ? String(row.user_id) : null,
     model: String(row.model || ''),
     provider: String(row.provider || ''),
+    api_mode: String(row.api_mode || ''),
     title,
+    parent_session_id: row.parent_session_id != null ? String(row.parent_session_id) : null,
+    fork_point_message_id: row.fork_point_message_id != null ? String(row.fork_point_message_id) : null,
     started_at: Number(row.started_at || 0),
     ended_at: row.ended_at != null ? Number(row.ended_at) : null,
     end_reason: row.end_reason != null ? String(row.end_reason) : null,
@@ -115,7 +126,11 @@ function mapSessionRow(row: Record<string, unknown>): HermesSessionRow {
     cost_status: String(row.cost_status || ''),
     preview: String(row.preview || ''),
     last_active: Number(row.last_active || 0),
+    is_archived: Number(row.is_archived || 0),
     workspace: row.workspace != null ? String(row.workspace) : null,
+    parent_title: row.parent_title != null ? String(row.parent_title) : null,
+    parent_last_message: row.parent_last_message != null ? String(row.parent_last_message) : null,
+    parent_last_message_role: row.parent_last_message_role != null ? String(row.parent_last_message_role) : null,
   }
 }
 
@@ -139,6 +154,7 @@ function mapMessageRow(row: Record<string, unknown>): HermesMessageRow {
   }
 }
 
+
 // --- Session CRUD ---
 
 export function createSession(data: {
@@ -151,7 +167,9 @@ export function createSession(data: {
   agent_native_session_id?: string
   model?: string
   provider?: string
+  api_mode?: string
   title?: string
+  parent_session_id?: string | null
   workspace?: string
 }): HermesSessionRow {
   const now = Math.floor(Date.now() / 1000)
@@ -162,18 +180,20 @@ export function createSession(data: {
       id: data.id, profile: data.profile || 'default', source, agent,
       agent_mode: data.agent_mode || '',
       agent_session_id: data.agent_session_id || '', agent_native_session_id: data.agent_native_session_id || '',
-      user_id: null, model: data.model || '', provider: data.provider || '', title: data.title || null,
+      user_id: null, model: data.model || '', provider: data.provider || '', api_mode: data.api_mode || '', title: data.title || null,
+      parent_session_id: data.parent_session_id || null,
+      fork_point_message_id: null,
       started_at: now, ended_at: null, end_reason: null,
       message_count: 0, tool_call_count: 0,
       input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0,
       billing_provider: null, estimated_cost_usd: 0, actual_cost_usd: null,
-      cost_status: '', preview: '', last_active: now, workspace: data.workspace || null,
+      cost_status: '', preview: '', last_active: now, is_archived: 0, workspace: data.workspace || null,
     }
   }
   const db = getDb()!
   db.prepare(
-    `INSERT INTO ${SESSIONS_TABLE} (id, profile, source, agent, agent_mode, agent_session_id, agent_native_session_id, model, provider, title, started_at, last_active, workspace)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${SESSIONS_TABLE} (id, profile, source, agent, agent_mode, agent_session_id, agent_native_session_id, model, provider, api_mode, title, parent_session_id, started_at, last_active, workspace)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     data.id,
     data.profile || 'default',
@@ -184,12 +204,123 @@ export function createSession(data: {
     data.agent_native_session_id || '',
     data.model || '',
     data.provider || '',
+    data.api_mode || '',
     data.title || null,
+    data.parent_session_id || null,
     now,
     now,
     data.workspace || null,
   )
   return getSession(data.id)!
+}
+
+export function createBranchedSession(data: {
+  parent_session_id: string
+  id: string
+  profile?: string
+  source?: string
+  agent?: string
+  agent_mode?: string
+  agent_session_id?: string
+  agent_native_session_id?: string
+  model?: string
+  provider?: string
+  api_mode?: string
+  title?: string
+  workspace?: string | null
+  ended_at: number
+  last_active: number
+  messages: Array<{
+    role: string
+    content: string
+    display_role?: string | null
+    display_content?: string | null
+    tool_call_id?: string | null
+    tool_calls?: any[] | null
+    tool_name?: string | null
+    timestamp?: number
+    token_count?: number | null
+    finish_reason?: string | null
+    reasoning?: string | null
+    reasoning_details?: string | null
+    reasoning_content?: string | null
+  }>
+}): HermesSessionRow | null {
+  if (!isSqliteAvailable()) return null
+  const db = getDb()!
+  const source = data.source || 'api_server'
+  const agent = data.agent || (source === 'cli' ? 'hermes' : '')
+  const insertMessage = db.prepare(
+    `INSERT INTO ${MESSAGES_TABLE} (session_id, role, content, display_role, display_content, tool_call_id, tool_calls, tool_name, timestamp, token_count, finish_reason, reasoning, reasoning_details, reasoning_content)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+
+  db.exec('BEGIN')
+  try {
+    db.prepare(
+      `UPDATE ${SESSIONS_TABLE} SET ended_at = ?, end_reason = ? WHERE id = ?`,
+    ).run(data.ended_at, 'branched', data.parent_session_id)
+
+    db.prepare(
+      `INSERT INTO ${SESSIONS_TABLE} (id, profile, source, agent, agent_mode, agent_session_id, agent_native_session_id, model, provider, api_mode, title, parent_session_id, started_at, last_active, workspace, message_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      data.id,
+      data.profile || 'default',
+      source,
+      agent,
+      data.agent_mode || '',
+      data.agent_session_id || '',
+      data.agent_native_session_id || '',
+      data.model || '',
+      data.provider || '',
+      data.api_mode || '',
+      data.title || null,
+      data.parent_session_id,
+      data.ended_at,
+      data.last_active,
+      data.workspace || null,
+      data.messages.length,
+    )
+
+    let forkPointMessageId: string | null = null
+    for (const msg of data.messages) {
+      const result = insertMessage.run(
+        data.id,
+        msg.role,
+        normalizeMessageContentForStorageRole(msg.role, msg.content),
+        msg.display_role ?? null,
+        msg.display_content ?? null,
+        msg.tool_call_id ?? null,
+        msg.tool_calls ? JSON.stringify(msg.tool_calls) : null,
+        msg.tool_name ?? null,
+        msg.timestamp ?? data.last_active,
+        msg.token_count ?? null,
+        msg.finish_reason ?? null,
+        msg.reasoning ?? null,
+        msg.reasoning_details ?? null,
+        msg.reasoning_content ?? null,
+      )
+      if (result.lastInsertRowid != null) forkPointMessageId = String(result.lastInsertRowid)
+    }
+
+    if (forkPointMessageId) {
+      db.prepare(
+        `UPDATE ${SESSIONS_TABLE} SET fork_point_message_id = ? WHERE id = ?`,
+      ).run(forkPointMessageId, data.id)
+    }
+
+    // Preserve the parent's compressed runtime context for the fork. The child
+    // copies parent messages 1:1, so the snapshot index remains valid and the
+    // first child turn can use summary+tail instead of re-sending raw history.
+    copyCompressionSnapshot(data.parent_session_id, data.id)
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+
+  return getSession(data.id)
 }
 
 export function getSession(id: string): HermesSessionRow | null {
@@ -253,6 +384,13 @@ export function renameSession(id: string, title: string): boolean {
   return result.changes > 0
 }
 
+export function setSessionArchived(id: string, archived: boolean): boolean {
+  if (!isSqliteAvailable()) return false
+  const db = getDb()!
+  const result = db.prepare(`UPDATE ${SESSIONS_TABLE} SET is_archived = ? WHERE id = ?`).run(archived ? 1 : 0, id)
+  return result.changes > 0
+}
+
 export function listSessions(profile?: string, source?: string, limit = 2000): HermesSessionRow[] {
   if (!isSqliteAvailable()) return []
   const db = getDb()!
@@ -272,8 +410,30 @@ export function listSessions(profile?: string, source?: string, limit = 2000): H
           LIMIT 1
         ),
         ''
-      ) AS preview
+      ) AS preview,
+      p.title AS parent_title,
+      (
+        SELECT REPLACE(REPLACE(m.content, CHAR(10), ' '), CHAR(13), ' ')
+        FROM ${MESSAGES_TABLE} m
+        WHERE m.session_id = s.parent_session_id
+          AND m.role IN ('user', 'assistant')
+          AND m.content IS NOT NULL
+          AND TRIM(m.content) <> ''
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT 1
+      ) AS parent_last_message,
+      (
+        SELECT m.role
+        FROM ${MESSAGES_TABLE} m
+        WHERE m.session_id = s.parent_session_id
+          AND m.role IN ('user', 'assistant')
+          AND m.content IS NOT NULL
+          AND TRIM(m.content) <> ''
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT 1
+      ) AS parent_last_message_role
     FROM ${SESSIONS_TABLE} s
+    LEFT JOIN ${SESSIONS_TABLE} p ON p.id = s.parent_session_id
     WHERE 1 = 1
       ${profileFilter ? 'AND s.profile = ?' : ''}
       ${source ? 'AND s.source = ?' : ''}
@@ -375,7 +535,32 @@ export interface PaginatedSessionDetailResult {
 export function getSessionDetail(id: string): HermesSessionDetailRow | null {
   if (!isSqliteAvailable()) return null
   const db = getDb()!
-  const sessionRow = db.prepare(`SELECT * FROM ${SESSIONS_TABLE} WHERE id = ?`).get(id) as Record<string, unknown> | undefined
+  const sessionRow = db.prepare(`
+    SELECT s.*, p.title AS parent_title,
+      (
+        SELECT REPLACE(REPLACE(m.content, CHAR(10), ' '), CHAR(13), ' ')
+        FROM ${MESSAGES_TABLE} m
+        WHERE m.session_id = s.parent_session_id
+          AND m.role IN ('user', 'assistant')
+          AND m.content IS NOT NULL
+          AND TRIM(m.content) <> ''
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT 1
+      ) AS parent_last_message,
+      (
+        SELECT m.role
+        FROM ${MESSAGES_TABLE} m
+        WHERE m.session_id = s.parent_session_id
+          AND m.role IN ('user', 'assistant')
+          AND m.content IS NOT NULL
+          AND TRIM(m.content) <> ''
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT 1
+      ) AS parent_last_message_role
+    FROM ${SESSIONS_TABLE} s
+    LEFT JOIN ${SESSIONS_TABLE} p ON p.id = s.parent_session_id
+    WHERE s.id = ?
+  `).get(id) as Record<string, unknown> | undefined
   if (!sessionRow) return null
   const msgRows = db.prepare(
     `SELECT * FROM ${MESSAGES_TABLE} WHERE session_id = ? ORDER BY id`,
@@ -500,7 +685,32 @@ export function getSessionDetailPaginated(
   const db = getDb()!
 
   // Get session info
-  const sessionRow = db.prepare(`SELECT * FROM ${SESSIONS_TABLE} WHERE id = ?`).get(id) as Record<string, unknown> | undefined
+  const sessionRow = db.prepare(`
+    SELECT s.*, p.title AS parent_title,
+      (
+        SELECT REPLACE(REPLACE(m.content, CHAR(10), ' '), CHAR(13), ' ')
+        FROM ${MESSAGES_TABLE} m
+        WHERE m.session_id = s.parent_session_id
+          AND m.role IN ('user', 'assistant')
+          AND m.content IS NOT NULL
+          AND TRIM(m.content) <> ''
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT 1
+      ) AS parent_last_message,
+      (
+        SELECT m.role
+        FROM ${MESSAGES_TABLE} m
+        WHERE m.session_id = s.parent_session_id
+          AND m.role IN ('user', 'assistant')
+          AND m.content IS NOT NULL
+          AND TRIM(m.content) <> ''
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT 1
+      ) AS parent_last_message_role
+    FROM ${SESSIONS_TABLE} s
+    LEFT JOIN ${SESSIONS_TABLE} p ON p.id = s.parent_session_id
+    WHERE s.id = ?
+  `).get(id) as Record<string, unknown> | undefined
   if (!sessionRow) return null
 
   // Get total message count

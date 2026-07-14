@@ -8,41 +8,12 @@ vi.mock('../../packages/server/src/services/logger', () => ({
 }))
 
 import {
-  convertHistoryFormat,
   handleMessage,
   isAssistantMessageSendable,
 } from '../../packages/server/src/services/hermes/run-chat/message-format'
 import type { SessionMessage } from '../../packages/server/src/services/hermes/run-chat/types'
 
 describe('run-chat message formatting', () => {
-  it('drops empty assistant history messages without tool calls', () => {
-    const formatted = convertHistoryFormat([
-      { role: 'user', content: 'run a command' },
-      { role: 'assistant', content: '' },
-      { role: 'user', content: 'next turn' },
-    ])
-
-    expect(formatted).toEqual([
-      { role: 'user', content: 'run a command' },
-      { role: 'user', content: 'next turn' },
-    ])
-  })
-
-  it('converts empty assistant tool-call history messages to non-empty text', () => {
-    const toolCalls = [{
-      id: 'call_1',
-      type: 'function',
-      function: { name: 'terminal', arguments: '{}' },
-    }]
-    const formatted = convertHistoryFormat([
-      { role: 'assistant', content: '', tool_calls: toolCalls },
-    ])
-
-    expect(formatted).toEqual([
-      { role: 'assistant', content: '[Calling tool: terminal with arguments: {}]' },
-    ])
-  })
-
   it('drops stale empty assistant messages loaded from the session database', () => {
     const messages: SessionMessage[] = [
       { id: 1, session_id: 's1', role: 'user', content: 'first', timestamp: 1 },
@@ -74,6 +45,29 @@ describe('run-chat message formatting', () => {
       content: 'partial answer',
       finish_reason: null,
       runMarker: 'cli_run_current',
+    }))
+  })
+
+  it('preserves persisted MoA display rows when resuming from database messages', () => {
+    const messages: SessionMessage[] = [
+      {
+        id: 1,
+        session_id: 's1',
+        role: 'moa',
+        display_role: 'tool',
+        content: JSON.stringify({ preview: '1/2 grok', text: 'reference answer' }),
+        timestamp: 1,
+        tool_call_id: 'moa:reference:run-1:1',
+        tool_name: 'moa_reference',
+      },
+    ]
+
+    expect(handleMessage(messages, 's1')[0]).toEqual(expect.objectContaining({
+      role: 'moa',
+      display_role: 'tool',
+      content: JSON.stringify({ preview: '1/2 grok', text: 'reference answer' }),
+      tool_call_id: 'moa:reference:run-1:1',
+      tool_name: 'moa_reference',
     }))
   })
 

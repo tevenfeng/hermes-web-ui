@@ -1,15 +1,16 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
-  clearTtsSecret,
+  deleteTtsProvider,
   fetchTtsSettings,
+  saveActiveTtsProvider,
   saveTtsSettings,
   type StoredTtsProvider,
   type TtsStoredSecretsInput,
   type TtsStoredSettings,
 } from '@/api/hermes/tts-settings'
 import {
-  clearSttSecret,
+  deleteSttProvider,
   fetchSttSettings,
   saveActiveSttProvider,
   saveSttSettings,
@@ -24,19 +25,19 @@ import { VOICE_API_PRESETS } from '@/constants/voiceApiPresets'
 import type { VoiceApiConnection, VoiceApiKind, VoiceApiProvider, VoiceApiSavePayload } from '@/types/voice-api'
 
 function isStoredSttProvider(provider: VoiceApiProvider): provider is StoredSttProvider {
-  return provider === 'openai' || provider === 'custom'
+  return provider === 'openai' || provider === 'custom' || provider === 'doubao'
 }
 
 function isStoredTtsProvider(provider: VoiceApiProvider): provider is StoredTtsProvider {
-  return provider === 'edge' || provider === 'openai' || provider === 'custom' || provider === 'mimo'
+  return provider === 'edge' || provider === 'openai' || provider === 'custom' || provider === 'mimo' || provider === 'doubao'
 }
 
 function isSttProvider(provider: VoiceApiProvider): provider is SttProvider {
-  return provider === 'browser' || provider === 'openai' || provider === 'custom'
+  return provider === 'browser' || provider === 'openai' || provider === 'custom' || provider === 'doubao'
 }
 
 function isTtsProvider(provider: VoiceApiProvider): provider is StoredTtsProvider {
-  return provider === 'edge' || provider === 'openai' || provider === 'custom' || provider === 'mimo'
+  return provider === 'edge' || provider === 'openai' || provider === 'custom' || provider === 'mimo' || provider === 'doubao'
 }
 
 function stringSetting(settings: object, key: string): string {
@@ -50,9 +51,11 @@ export function useVoiceApiConnections() {
   const loading = ref(false)
   const vs = useVoiceSettings()
   const stt = useSttSettings()
+  const activeTtsProvider = ref<StoredTtsProvider>(vs.provider.value === 'webspeech' ? 'edge' : vs.provider.value)
+  const activeSttProvider = ref<SttProvider>(stt.provider.value)
 
-  const activeTtsId = computed(() => `tts-${vs.provider.value === 'webspeech' ? 'edge' : vs.provider.value}`)
-  const activeSttId = computed(() => `stt-${stt.provider.value}`)
+  const activeTtsId = computed(() => `tts-${activeTtsProvider.value}`)
+  const activeSttId = computed(() => `stt-${activeSttProvider.value}`)
 
   const ttsConnections = computed(() => connections.value.filter(c => c.kind === 'tts'))
   const sttConnections = computed(() => connections.value.filter(c => c.kind === 'stt'))
@@ -93,6 +96,16 @@ export function useVoiceApiConnections() {
       vs.setMimoVoice(connection.voice || stringSetting(settings, 'voice') || vs.mimoVoice.value)
       vs.setMimoStylePrompt(stringSetting(settings, 'stylePrompt'))
       vs.setMimoVoiceDesignDesc(stringSetting(settings, 'voiceDesignDesc'))
+      const cloneFormat = stringSetting(settings, 'voiceCloneFormat')
+      if (cloneFormat === 'mp3' || cloneFormat === 'wav') vs.setMimoVoiceCloneFormat(cloneFormat)
+      return
+    }
+
+    if (connection.provider === 'doubao') {
+      vs.setDoubaoBaseUrl(connection.baseUrl || stringSetting(settings, 'baseUrl') || vs.doubaoBaseUrl.value)
+      vs.setDoubaoModel(connection.model || stringSetting(settings, 'model') || vs.doubaoModel.value)
+      vs.setDoubaoVoice(connection.voice || stringSetting(settings, 'voice') || vs.doubaoVoice.value)
+      vs.setDoubaoStylePrompt(stringSetting(settings, 'stylePrompt'))
     }
   }
 
@@ -155,6 +168,14 @@ export function useVoiceApiConnections() {
         fetchTtsSettings(),
         fetchSttSettings(),
       ])
+      if (ttsData.activeProvider && isTtsProvider(ttsData.activeProvider)) {
+        activeTtsProvider.value = ttsData.activeProvider
+        vs.setProvider(ttsData.activeProvider)
+      }
+      if (sttData.activeProvider && isSttProvider(sttData.activeProvider)) {
+        activeSttProvider.value = sttData.activeProvider
+        stt.setProvider(sttData.activeProvider)
+      }
 
       const newConnections: VoiceApiConnection[] = [
         {
@@ -214,11 +235,16 @@ export function useVoiceApiConnections() {
     if (!connection) return
 
     if (kind === 'tts') {
-      applyTtsConnectionToLegacyState(connection)
+      if (isTtsProvider(connection.provider)) {
+        const provider = await saveActiveTtsProvider(connection.provider)
+        activeTtsProvider.value = provider
+        applyTtsConnectionToLegacyState(connection)
+      }
     } else {
-      applySttConnectionToLegacyState(connection)
       if (isSttProvider(connection.provider)) {
-        await saveActiveSttProvider(connection.provider)
+        const provider = await saveActiveSttProvider(connection.provider)
+        activeSttProvider.value = provider
+        applySttConnectionToLegacyState(connection)
       }
     }
 
@@ -231,17 +257,30 @@ export function useVoiceApiConnections() {
   async function saveConnection(kind: VoiceApiKind, provider: VoiceApiProvider, payload: VoiceApiSavePayload) {
     if (kind === 'tts') {
       if (!isStoredTtsProvider(provider)) throw new Error(`Unsupported TTS provider: ${String(provider)}`)
+      const settings = { ...(payload.settings || {}) }
+      const hasCloneDataUri = Object.prototype.hasOwnProperty.call(settings, 'voiceCloneDataUri')
+      const hasCloneFileName = Object.prototype.hasOwnProperty.call(settings, 'voiceCloneFileName')
+      const cloneDataUri = settings.voiceCloneDataUri
+      const cloneFileName = settings.voiceCloneFileName
+      delete settings.voiceCloneDataUri
+      delete settings.voiceCloneFileName
       const res = await saveTtsSettings(provider, {
-        settings: payload.settings as TtsStoredSettings | undefined,
+        settings: settings as TtsStoredSettings,
         secrets: payload.secrets as TtsStoredSecretsInput | undefined,
+        activeProvider: provider,
       })
       await refresh()
       await setActiveConnection('tts', `tts-${provider}`)
+      if (provider === 'mimo') {
+        if (hasCloneDataUri && typeof cloneDataUri === 'string') vs.setMimoVoiceCloneDataUri(cloneDataUri)
+        if (hasCloneFileName && typeof cloneFileName === 'string') vs.setMimoVoiceCloneFileName(cloneFileName)
+      }
       return res
     }
 
     if (provider === 'browser') {
-      await saveActiveSttProvider('browser')
+      const activeProvider = await saveActiveSttProvider('browser')
+      activeSttProvider.value = activeProvider
       stt.setProvider('browser')
       await refresh()
       return null
@@ -260,11 +299,11 @@ export function useVoiceApiConnections() {
 
   async function deleteSecret(kind: VoiceApiKind, provider: VoiceApiProvider) {
     if (kind === 'tts') {
-      if (!isStoredTtsProvider(provider)) return
-      await clearTtsSecret(provider, 'apiKey')
+      if (!isStoredTtsProvider(provider) || provider === 'edge') return
+      await deleteTtsProvider(provider)
     } else {
       if (!isStoredSttProvider(provider)) return
-      await clearSttSecret(provider, 'apiKey')
+      await deleteSttProvider(provider)
     }
     await refresh()
   }

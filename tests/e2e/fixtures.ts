@@ -10,10 +10,28 @@ export interface MockedRequest {
   postData: string | null
 }
 
+interface MockJourneyPayload {
+  graph: {
+    nodes: unknown[]
+    edges: unknown[]
+    clusters: unknown[]
+    memory?: unknown[]
+    stats?: Record<string, unknown>
+  }
+}
+
+interface MockSkillsPayload {
+  categories: unknown[]
+  archived: unknown[]
+  paths?: unknown
+}
+
 interface MockHermesApiOptions {
   tokenValidationStatus?: number
   initialProfileName?: 'default' | 'research'
   sessions?: unknown[]
+  journey?: MockJourneyPayload
+  skills?: MockSkillsPayload
 }
 
 const sampleModelGroup = {
@@ -175,6 +193,25 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
       return
     }
 
+    if (pathname === '/api/hermes/journey' && options.journey) {
+      await route.fulfill(jsonResponse({
+        profile: request.headers()['x-hermes-profile'] || activeProfileName,
+        source: 'cli',
+        graph: options.journey.graph,
+      }))
+      return
+    }
+
+    if (pathname === '/api/hermes/skills' && options.skills) {
+      await route.fulfill(jsonResponse(options.skills))
+      return
+    }
+
+    if (/^\/api\/hermes\/sessions\/[^/]+\/workspace-run-changes$/.test(pathname)) {
+      await route.fulfill(jsonResponse({ changes: [] }))
+      return
+    }
+
     if (pathname === '/api/hermes/files/list') {
       await route.fulfill(jsonResponse({ entries: [], path: '' }))
       return
@@ -209,6 +246,11 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
 
     if (pathname === '/api/hermes/config/auxiliary-models') {
       await route.fulfill(jsonResponse({ tasks: sampleAuxiliaryModelTasks, auxiliary: {} }))
+      return
+    }
+
+    if (pathname === '/api/hermes/pets/active') {
+      await route.fulfill(jsonResponse({ pet: null }))
       return
     }
 

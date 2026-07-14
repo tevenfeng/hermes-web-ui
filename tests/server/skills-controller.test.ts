@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Readable } from 'stream'
@@ -164,6 +164,155 @@ describe('skills controller', () => {
     }
   })
 
+  it('lists flat symlinked skills in the misc category', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hermes-web-ui-symlink-flat-skill-'))
+    const profileDir = join(root, 'profile')
+    const profileSkillsDir = join(profileDir, 'skills')
+    const sharedSkillDir = join(root, 'shared-skills', 'linked-flat-skill')
+
+    await mkdir(profileSkillsDir, { recursive: true })
+    await mkdir(sharedSkillDir, { recursive: true })
+    await writeFile(join(sharedSkillDir, 'SKILL.md'), '# Linked Flat Skill\nflat symlink copy\n', 'utf-8')
+    await symlink(sharedSkillDir, join(profileSkillsDir, 'linked-flat-skill'))
+
+    mockGetProfileDir.mockReturnValue(profileDir)
+
+    try {
+      const { list } = await loadController()
+      const ctx: any = { state: { profile: { name: 'research' } }, body: null }
+
+      await list(ctx)
+
+      expect(ctx.body.categories).toContainEqual(expect.objectContaining({
+        name: 'misc',
+        skills: [
+          expect.objectContaining({
+            name: 'linked-flat-skill',
+            source: 'local',
+            description: 'flat symlink copy',
+          }),
+        ],
+      }))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('lists Codex user and system skills for the codex target', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hermes-web-ui-codex-skills-'))
+    const previousHome = process.env.HOME
+    const userSkillDir = join(root, '.agents', 'skills', 'user-skill')
+    const systemSkillDir = join(root, '.codex', 'skills', '.system', 'system-skill')
+
+    await mkdir(userSkillDir, { recursive: true })
+    await mkdir(systemSkillDir, { recursive: true })
+    await writeFile(join(userSkillDir, 'SKILL.md'), '# User Skill\nuser codex skill\n', 'utf-8')
+    await writeFile(join(systemSkillDir, 'SKILL.md'), '# System Skill\nsystem codex skill\n', 'utf-8')
+    process.env.HOME = root
+
+    try {
+      const { list } = await loadController()
+      const ctx: any = { query: { target: 'codex' }, state: { profile: { name: 'research' } }, body: null }
+
+      await list(ctx)
+
+      const misc = ctx.body.categories.find((category: any) => category.name === 'misc')
+      expect(misc.skills).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'user-skill', source: 'local', description: 'user codex skill' }),
+        expect.objectContaining({ name: 'system-skill', source: 'builtin', description: 'system codex skill' }),
+      ]))
+      expect(ctx.body.paths).toEqual({
+        local: join(root, '.agents', 'skills'),
+        external: [join(root, '.codex', 'skills', '.system')],
+      })
+      expect(mockReadConfigYamlForProfile).not.toHaveBeenCalled()
+    } finally {
+      if (previousHome == null) delete process.env.HOME
+      else process.env.HOME = previousHome
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reads Codex system skill details for the codex target', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hermes-web-ui-codex-system-skill-'))
+    const previousHome = process.env.HOME
+    const systemSkillDir = join(root, '.codex', 'skills', '.system', 'imagegen')
+
+    await mkdir(join(systemSkillDir, 'references'), { recursive: true })
+    await writeFile(join(systemSkillDir, 'SKILL.md'), '# Imagegen\nsystem image skill\n', 'utf-8')
+    await writeFile(join(systemSkillDir, 'references', 'usage.md'), 'usage notes\n', 'utf-8')
+    process.env.HOME = root
+    mockListFilesRecursive.mockResolvedValue([
+      { path: 'SKILL.md', isDir: false },
+      { path: 'references/usage.md', isDir: false },
+    ])
+
+    try {
+      const { readFile_, listFiles } = await loadController()
+      const readCtx: any = {
+        query: { target: 'codex' },
+        params: { path: 'misc/imagegen/SKILL.md' },
+        state: { profile: { name: 'research' } },
+        body: null,
+      }
+
+      await readFile_(readCtx)
+
+      expect(readCtx.body).toEqual({ content: '# Imagegen\nsystem image skill\n' })
+
+      const filesCtx: any = {
+        query: { target: 'codex' },
+        params: { category: 'misc', skill: 'imagegen' },
+        state: { profile: { name: 'research' } },
+        body: null,
+      }
+
+      await listFiles(filesCtx)
+
+      expect(filesCtx.body).toEqual({ files: [{ path: 'references/usage.md', isDir: false }] })
+    } finally {
+      if (previousHome == null) delete process.env.HOME
+      else process.env.HOME = previousHome
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('traverses symlinked category entries without following hidden or cyclic links', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hermes-web-ui-symlink-category-skill-'))
+    const profileDir = join(root, 'profile')
+    const toolsDir = join(profileDir, 'skills', 'tools')
+    const linkedSkillDir = join(root, 'shared-skills', 'linked-skill')
+    const linkedCategoryDir = join(root, 'shared-skills', 'linked-category')
+
+    await mkdir(toolsDir, { recursive: true })
+    await mkdir(linkedSkillDir, { recursive: true })
+    await mkdir(linkedCategoryDir, { recursive: true })
+    await writeFile(join(toolsDir, 'DESCRIPTION.md'), '# Tools\n', 'utf-8')
+    await writeFile(join(linkedSkillDir, 'SKILL.md'), '# Linked Skill\nlinked skill copy\n', 'utf-8')
+    await writeFile(join(linkedCategoryDir, 'SKILL.md'), '# Linked Category Skill\nlinked category copy\n', 'utf-8')
+    await symlink(linkedSkillDir, join(toolsDir, 'linked-skill'))
+    await symlink(linkedCategoryDir, join(toolsDir, 'linked-group'))
+    await symlink(toolsDir, join(toolsDir, 'loop'))
+    await symlink(linkedSkillDir, join(toolsDir, '.hidden-skill'))
+
+    mockGetProfileDir.mockReturnValue(profileDir)
+
+    try {
+      const { list } = await loadController()
+      const ctx: any = { state: { profile: { name: 'research' } }, body: null }
+
+      await list(ctx)
+
+      const tools = ctx.body.categories.find((category: any) => category.name === 'tools')
+      expect(tools.skills).toEqual([
+        expect.objectContaining({ name: 'linked-group', description: 'linked category copy', source: 'local' }),
+        expect.objectContaining({ name: 'linked-skill', description: 'linked skill copy', source: 'local' }),
+      ])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('updates external skill directories in the request-scoped profile config', async () => {
     let updatedConfig: Record<string, any> | undefined
     mockUpdateConfigYamlForProfile.mockImplementation(async (_profile: string, updater: (config: Record<string, any>) => Record<string, any>) => {
@@ -289,6 +438,86 @@ describe('skills controller', () => {
       await expect(readFile(join(researchSkillDir, 'SKILL.md'), 'utf-8')).rejects.toThrow()
       expect(ctx.body).toEqual({ success: true })
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('updates local skill content in the request-scoped profile directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hermes-web-ui-update-skill-'))
+    const defaultProfileDir = join(root, 'default')
+    const researchProfileDir = join(root, 'research')
+    const defaultSkillDir = join(defaultProfileDir, 'skills', 'tools', 'dupe-skill')
+    const researchSkillDir = join(researchProfileDir, 'skills', 'tools', 'dupe-skill')
+    await mkdir(defaultSkillDir, { recursive: true })
+    await mkdir(researchSkillDir, { recursive: true })
+    await writeFile(join(defaultSkillDir, 'SKILL.md'), '# Default Copy\n', 'utf-8')
+    await writeFile(join(researchSkillDir, 'SKILL.md'), '# Research Copy\n', 'utf-8')
+    mockGetProfileDir.mockImplementation((profile: string) => profile === 'research' ? researchProfileDir : defaultProfileDir)
+
+    const ctx: any = {
+      query: {},
+      params: { category: 'tools', skill: 'dupe-skill' },
+      request: { body: { content: '# Updated Research Copy\n' } },
+      state: { profile: { name: 'research' } },
+      body: null,
+    }
+
+    try {
+      const { updateSkill } = await loadController()
+
+      await updateSkill(ctx)
+
+      await expect(readFile(join(defaultSkillDir, 'SKILL.md'), 'utf-8')).resolves.toBe('# Default Copy\n')
+      await expect(readFile(join(researchSkillDir, 'SKILL.md'), 'utf-8')).resolves.toBe('# Updated Research Copy\n')
+      expect(ctx.body).toEqual({ success: true })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('updates Codex user skills but not Codex system skills', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hermes-web-ui-update-codex-skill-'))
+    const previousHome = process.env.HOME
+    const userSkillDir = join(root, '.agents', 'skills', 'user-skill')
+    const systemSkillDir = join(root, '.codex', 'skills', '.system', 'system-skill')
+
+    await mkdir(userSkillDir, { recursive: true })
+    await mkdir(systemSkillDir, { recursive: true })
+    await writeFile(join(userSkillDir, 'SKILL.md'), '# User Skill\n', 'utf-8')
+    await writeFile(join(systemSkillDir, 'SKILL.md'), '# System Skill\n', 'utf-8')
+    process.env.HOME = root
+
+    try {
+      const { updateSkill } = await loadController()
+      const userCtx: any = {
+        query: { target: 'codex' },
+        params: { category: 'misc', skill: 'user-skill' },
+        request: { body: { content: '# Updated User Skill\n' } },
+        state: { profile: { name: 'research' } },
+        body: null,
+      }
+
+      await updateSkill(userCtx)
+
+      await expect(readFile(join(userSkillDir, 'SKILL.md'), 'utf-8')).resolves.toBe('# Updated User Skill\n')
+      expect(userCtx.body).toEqual({ success: true })
+
+      const systemCtx: any = {
+        query: { target: 'codex' },
+        params: { category: 'misc', skill: 'system-skill' },
+        request: { body: { content: '# Updated System Skill\n' } },
+        state: { profile: { name: 'research' } },
+        body: null,
+      }
+
+      await updateSkill(systemCtx)
+
+      await expect(readFile(join(systemSkillDir, 'SKILL.md'), 'utf-8')).resolves.toBe('# System Skill\n')
+      expect(systemCtx.status).toBe(404)
+      expect(systemCtx.body).toEqual({ error: 'Skill not found' })
+    } finally {
+      if (previousHome == null) delete process.env.HOME
+      else process.env.HOME = previousHome
       await rm(root, { recursive: true, force: true })
     }
   })

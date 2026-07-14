@@ -6,6 +6,8 @@ import { useSpeech, type MimoTtsOptions, type OpenaiTtsOptions } from '@/composa
 import { useMicRecorder } from '@/composables/useMicRecorder'
 import { transcribeSpeech } from '@/api/hermes/stt'
 import { useVoiceApiConnections } from '@/composables/useVoiceApiConnections'
+import { useVoiceSettings } from '@/composables/useVoiceSettings'
+import { speedToEdgeRate, hzToEdgePitch } from '@/utils/ttsHelpers'
 import VoiceApiCard, { type VoiceApiCardTestState } from './voice/VoiceApiCard.vue'
 import VoiceApiFormModal from './voice/VoiceApiFormModal.vue'
 import VoiceApiConfigurator from './voice/VoiceApiConfigurator.vue'
@@ -22,6 +24,7 @@ const { t } = useI18n()
 const message = useMessage()
 const speech = useSpeech()
 const voiceApi = useVoiceApiConnections()
+const voiceSettings = useVoiceSettings()
 
 const testText = ref(t('settings.voice.testTextDefault'))
 const showAddModal = ref(false)
@@ -121,15 +124,22 @@ function ttsOptionsFor(connection: VoiceApiConnection): Record<string, unknown> 
 
 function openaiOptionsFor(connection: VoiceApiConnection): OpenaiTtsOptions {
   const options = ttsOptionsFor(connection)
-  const provider = connection.provider === 'edge' || connection.provider === 'openai' || connection.provider === 'custom'
+  const provider = connection.provider === 'edge' || connection.provider === 'openai' || connection.provider === 'custom' || connection.provider === 'doubao'
     ? connection.provider
     : undefined
+  const edgeRate = Number(options.rate)
+  const edgePitch = Number(options.pitch)
   return {
     baseUrl: String(options.baseUrl || ''),
     model: typeof options.model === 'string' ? options.model : undefined,
     voice: typeof options.voice === 'string' ? options.voice : undefined,
-    rate: typeof options.rate === 'string' ? options.rate : undefined,
-    pitch: typeof options.pitch === 'string' ? options.pitch : undefined,
+    rate: connection.provider === 'edge' && Number.isFinite(edgeRate)
+      ? speedToEdgeRate(edgeRate)
+      : typeof options.rate === 'string' ? options.rate : undefined,
+    pitch: connection.provider === 'edge' && Number.isFinite(edgePitch)
+      ? hzToEdgePitch(edgePitch)
+      : typeof options.pitch === 'string' ? options.pitch : undefined,
+    stylePrompt: typeof options.stylePrompt === 'string' ? options.stylePrompt : undefined,
     provider,
   }
 }
@@ -143,8 +153,12 @@ function mimoOptionsFor(connection: VoiceApiConnection): MimoTtsOptions {
     authMode: options.authMode === 'api-key' || options.authMode === 'bearer' || options.authMode === 'both' ? options.authMode : undefined,
     voiceMode: options.voiceMode === 'preset' || options.voiceMode === 'voiceDesign' || options.voiceMode === 'voiceClone' ? options.voiceMode : undefined,
     voiceDesignDesc: typeof options.voiceDesignDesc === 'string' ? options.voiceDesignDesc : undefined,
-    voiceCloneDataUri: typeof options.voiceCloneDataUri === 'string' ? options.voiceCloneDataUri : undefined,
-    voiceCloneFormat: options.voiceCloneFormat === 'mp3' || options.voiceCloneFormat === 'wav' ? options.voiceCloneFormat : undefined,
+    voiceCloneDataUri: typeof options.voiceCloneDataUri === 'string'
+      ? options.voiceCloneDataUri
+      : voiceSettings.mimoVoiceCloneDataUri.value || undefined,
+    voiceCloneFormat: options.voiceCloneFormat === 'mp3' || options.voiceCloneFormat === 'wav'
+      ? options.voiceCloneFormat
+      : voiceSettings.mimoVoiceCloneFormat.value,
     stylePrompt: typeof options.stylePrompt === 'string' ? options.stylePrompt : undefined,
   }
 }
@@ -165,7 +179,7 @@ async function handleTtsTest(connection: VoiceApiConnection) {
   try {
     if (connection.provider === 'mimo') {
       await speech.mimoPlay(connection.id, text, mimoOptionsFor(connection))
-    } else if (connection.provider === 'edge' || connection.provider === 'openai' || connection.provider === 'custom') {
+    } else if (connection.provider === 'edge' || connection.provider === 'openai' || connection.provider === 'custom' || connection.provider === 'doubao') {
       await speech.openaiPlay(connection.id, text, openaiOptionsFor(connection))
     }
     setCardTestState(connection.id, 'success', t('settings.voice.testSuccess'))

@@ -26,71 +26,9 @@ function hasSendableContent(content: unknown): boolean {
   return false
 }
 
-function toolCallsToText(toolCalls: any[]): string {
-  return toolCalls
-    .map((tc: any) => {
-      const name = tc?.function?.name || 'unknown'
-      let args = typeof tc?.function?.arguments === 'string'
-        ? tc.function.arguments
-        : JSON.stringify(tc?.function?.arguments ?? {})
-      if (args.length > 4000) args = `${args.slice(0, 4000)}...`
-      return `[Calling tool: ${name} with arguments: ${args}]`
-    })
-    .join('\n')
-}
-
 export function isAssistantMessageSendable(message: { content?: unknown; tool_calls?: any }): boolean {
   if (hasSendableContent(message.content)) return true
   return cleanToolCalls(message.tool_calls).length > 0
-}
-
-/**
- * Convert OpenAI format conversation history to Anthropic format.
- */
-export function convertHistoryFormat(messages: any[]): any[] {
-  const result: any[] = []
-
-  for (const m of messages) {
-    const role = m.role
-    const content = m.content || ''
-    delete m.reasoning_content
-    if (role === 'tool') {
-      let pushItem = { ...m }
-      pushItem.role = 'user'
-      pushItem.content = `[Tool result: ${content}]`
-      result.push(pushItem)
-      continue
-    }
-
-    if (role === 'user') {
-      if (typeof content === 'string') {
-        result.push({ role: 'user', content: content })
-      } else if (Array.isArray(content)) {
-        const textParts = content
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('\n')
-        result.push({ role: 'user', content: textParts || JSON.stringify(content) })
-      }
-      continue
-    }
-    if (role === 'assistant') {
-      const toolCalls = cleanToolCalls(m.tool_calls)
-      const item = { ...m }
-      delete item.reasoning_content
-      if (toolCalls.length > 0 && !hasSendableContent(item.content)) {
-        item.content = toolCallsToText(toolCalls)
-      }
-      delete item.tool_calls
-      if (!isAssistantMessageSendable(item)) {
-        logger.warn('[chat-run-socket] skipped empty assistant message in conversation history')
-        continue
-      }
-      result.push(item)
-      continue
-    }
-  }
-  return result
 }
 
 /**
@@ -101,7 +39,7 @@ export function handleMessage(messages: SessionMessage[], sid: string): any[] {
   let _messages = []
   try {
     _messages = messages
-      .filter(m => (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'command') && m.content !== undefined)
+      .filter(m => (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'command' || m.role === 'moa') && m.content !== undefined)
       .map((m, idx, arr) => {
         const msg: any = {
           id: m.id,
@@ -111,6 +49,8 @@ export function handleMessage(messages: SessionMessage[], sid: string): any[] {
           reasoning: m.reasoning || '',
           timestamp: m.timestamp,
         }
+        if (m.display_role) msg.display_role = m.display_role
+        if (m.display_content != null) msg.display_content = m.display_content
         if (Object.prototype.hasOwnProperty.call(m, 'finish_reason')) {
           msg.finish_reason = m.finish_reason ?? null
         }
@@ -206,6 +146,7 @@ export function handleMessage(messages: SessionMessage[], sid: string): any[] {
           if (!callId || callId.length === 0) return null
           msg.tool_call_id = callId
         }
+        if (m.role === 'moa' && m.tool_call_id) msg.tool_call_id = m.tool_call_id
 
         if (m.tool_name) msg.tool_name = m.tool_name
         if (m.reasoning) msg.reasoning = m.reasoning

@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import type { Message, ContentBlock } from "@/stores/hermes/chat";
-import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
-import { useMessage } from "naive-ui";
+import { NButton, NDrawer, NDrawerContent, NSpin, useMessage } from "naive-ui";
 import { downloadFile, getDownloadUrl } from "@/api/hermes/download";
 import { copyToClipboard } from "@/utils/clipboard";
-import MarkdownRenderer from "./MarkdownRenderer.vue";
 import { parseThinking, countThinkingChars } from "@/utils/thinking-parser";
 import { useChatStore } from "@/stores/hermes/chat";
+import { useFilesStore } from "@/stores/hermes/files";
 import { useProfilesStore } from "@/stores/hermes/profiles";
 import { useSettingsStore } from "@/stores/hermes/settings";
 import ProfileAvatar from "@/components/hermes/profiles/ProfileAvatar.vue";
@@ -21,6 +21,11 @@ import {
 import { useGlobalSpeech } from "@/composables/useSpeech";
 import { useVoiceSettings } from "@/composables/useVoiceSettings";
 import { speedToEdgeRate, hzToEdgePitch } from "@/utils/ttsHelpers";
+import { formatChatTimestamp } from "@/utils/chat-timestamp";
+import type { WorkspaceRunChangeFileSummary } from "@/api/hermes/sessions";
+
+const FileEditor = defineAsyncComponent(() => import("@/components/hermes/files/FileEditor.vue"));
+const MarkdownRenderer = defineAsyncComponent(async () => (await import("./MarkdownRenderer.vue")).default);
 
 const TOOL_PAYLOAD_DISPLAY_LIMIT = 1000;
 const JSON_STRING_DISPLAY_LIMIT = 200;
@@ -30,7 +35,7 @@ const JSON_MAX_KEYS_PER_OBJECT = 50;
 const JSON_MAX_ITEMS_PER_ARRAY = 50;
 const JSON_TRUNCATED_KEY = "__truncated__";
 
-const props = defineProps<{ message: Message; highlight?: boolean; headingIdPrefix?: string }>();
+const props = defineProps<{ message: Message; highlight?: boolean; headingIdPrefix?: string; showForkAction?: boolean }>();
 const { t } = useI18n();
 const toast = useMessage();
 
@@ -179,8 +184,15 @@ function getContentFileUrl(file: DisplayContentFile): string {
 
 const toolExpanded = ref(false);
 const previewUrl = ref<string | null>(null);
+const selectedToolChangeFileId = ref<number | null>(null);
+const selectedToolChangePatch = ref("");
+const isLoadingToolChangePatch = ref(false);
+const toolChangeDrawerVisible = ref(false);
+const toolChangeDrawerMode = ref<"diff" | "edit">("diff");
+const toolChangeDrawerFile = ref<WorkspaceRunChangeFileSummary | null>(null);
 
 const chatStore = useChatStore();
+const filesStore = useFilesStore();
 const profilesStore = useProfilesStore();
 const settingsStore = useSettingsStore();
 const speech = useGlobalSpeech();
@@ -195,6 +207,11 @@ const copyableContent = computed(() => {
   if (!content.trim()) return null
   return content
 })
+
+function forkFromCurrentTail() {
+  if (!props.showForkAction || chatStore.isStreaming || chatStore.isForkPending) return
+  chatStore.sendMessage('/fork')
+}
 
 async function copyBubbleContent() {
   const text = copyableContent.value
@@ -293,10 +310,7 @@ function formatDuration(ms: number): string {
   return r === 0 ? `${m}m` : `${m}m ${r}s`;
 }
 
-const timeStr = computed(() => {
-  const d = new Date(props.message.timestamp);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-});
+const timeStr = computed(() => formatChatTimestamp(props.message.timestamp));
 
 function isImage(type: string): boolean {
   return type.startsWith("image/");
@@ -496,10 +510,11 @@ function formatToolPayload(raw?: unknown, extractDiff = false): ToolPayload {
   };
 }
 
-function renderToolPayload(content: string, language?: string): string {
+function renderToolPayload(content: string, language?: string, options: { showCopyButton?: boolean } = {}): string {
   return renderHighlightedCodeBlock(content, language, t("common.copy"), {
     maxHighlightLength: TOOL_PAYLOAD_DISPLAY_LIMIT,
     formatDiffFoldLabel: (hiddenCount) => t("chat.unchangedLines", { count: hiddenCount }),
+    showCopyButton: options.showCopyButton,
   });
 }
 
@@ -537,9 +552,11 @@ const hasAttachments = computed(
 
 const toolArgsPayload = computed(() => formatToolPayload(props.message.toolArgs));
 const toolResultPayload = computed(() => formatToolPayload(props.message.toolResult, true));
+const toolChange = computed(() => props.message.toolChange || null);
+const hasToolChange = computed(() => (toolChange.value?.files?.length || 0) > 0);
 
 const hasToolDetails = computed(
-  () => !!(toolArgsPayload.value.full || toolResultPayload.value.full),
+  () => !!(toolArgsPayload.value.full || toolResultPayload.value.full || hasToolChange.value),
 );
 
 const fullToolArgs = computed(() => toolArgsPayload.value.full);
@@ -563,27 +580,130 @@ const renderedToolResult = computed(() => {
   );
 });
 
+const renderedToolChangePatch = computed(() => {
+  if (!selectedToolChangePatch.value) return "";
+  return renderToolPayload(selectedToolChangePatch.value, "diff", {
+    showCopyButton: false,
+  });
+});
+
+function fileNameFromPath(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function fileExtension(path: string): string {
+  const name = fileNameFromPath(path);
+  const index = name.lastIndexOf(".");
+  if (index >= 0) return name.slice(index + 1).toLowerCase();
+  const lower = name.toLowerCase();
+  if (lower === "dockerfile") return "docker";
+  if (lower === "makefile") return "make";
+  return "file";
+}
+
+function fileBadgeClass(path: string): string {
+  const ext = fileExtension(path);
+  if (ext === "js" || ext === "ts" || ext === "jsx" || ext === "tsx") return "script";
+  if (ext === "py" || ext === "rb" || ext === "php") return "dynamic";
+  if (ext === "java" || ext === "kt" || ext === "scala") return "jvm";
+  if (ext === "rs" || ext === "go" || ext === "c" || ext === "cc" || ext === "cpp" || ext === "h" || ext === "hpp") return "systems";
+  if (ext === "html" || ext === "vue") return "markup";
+  if (ext === "css" || ext === "scss" || ext === "sass" || ext === "less") return "style";
+  if (ext === "json" || ext === "yaml" || ext === "yml" || ext === "toml" || ext === "xml") return "data";
+  if (ext === "md" || ext === "mdx" || ext === "txt") return "doc";
+  if (ext === "sh" || ext === "bash" || ext === "zsh" || ext === "fish" || ext === "docker" || ext === "make") return "shell";
+  return "default";
+}
+
+const selectedToolChangeFileName = computed(() =>
+  toolChangeDrawerFile.value ? fileNameFromPath(toolChangeDrawerFile.value.path) : "",
+);
+
+const selectedToolChangeAbsolutePath = computed(() => {
+  const file = toolChangeDrawerFile.value;
+  const workspace = toolChange.value?.workspace || "";
+  if (!file || !workspace) return file?.path || "";
+  const separator = workspace.includes("\\") && !workspace.includes("/") ? "\\" : "/";
+  const cleanWorkspace = workspace.replace(/[\\/]+$/, "");
+  return `${cleanWorkspace}${separator}${file.path}`;
+});
+
+async function openToolChangeFile(file: WorkspaceRunChangeFileSummary): Promise<void> {
+  selectedToolChangeFileId.value = file.id;
+  toolChangeDrawerFile.value = file;
+  toolChangeDrawerMode.value = "diff";
+  toolChangeDrawerVisible.value = true;
+  selectedToolChangePatch.value = "";
+  if (file.binary) {
+    selectedToolChangePatch.value = t("chat.binaryFileDiffUnavailable");
+    return;
+  }
+  isLoadingToolChangePatch.value = true;
+  try {
+    const detail = await chatStore.loadWorkspaceRunChangeFile(file.session_id, file.change_id, file.id);
+    selectedToolChangePatch.value = detail?.patch || t("chat.diffUnavailable");
+  } finally {
+    isLoadingToolChangePatch.value = false;
+  }
+}
+
+async function editSelectedToolChangeFile(): Promise<void> {
+  const file = toolChangeDrawerFile.value;
+  const sessionId = toolChange.value?.session_id || props.message.toolChange?.session_id || "";
+  if (!file || !sessionId) return;
+  isLoadingToolChangePatch.value = true;
+  try {
+    await filesStore.openSessionWorkspaceEditor(sessionId, file.path);
+    toolChangeDrawerMode.value = "edit";
+  } catch (err: any) {
+    toast.error(err?.message || t("chat.diffUnavailable"));
+  } finally {
+    isLoadingToolChangePatch.value = false;
+  }
+}
+
+function closeToolChangeDrawer() {
+  if (toolChangeDrawerMode.value === "edit" && filesStore.hasUnsavedChanges) {
+    toast.warning(t("files.unsavedChanges"));
+    return;
+  }
+  toolChangeDrawerVisible.value = false;
+  toolChangeDrawerMode.value = "diff";
+  if (filesStore.editingFile?.path === selectedToolChangeAbsolutePath.value && !filesStore.hasUnsavedChanges) {
+    filesStore.closeEditor();
+  }
+}
+
+function closeToolChangeEditor() {
+  if (filesStore.hasUnsavedChanges) {
+    toast.warning(t("files.unsavedChanges"));
+    return;
+  }
+  filesStore.closeEditor();
+  toolChangeDrawerMode.value = "diff";
+}
+
 // 语音播放相关
 const canPlaySpeech = computed(() => {
   // 只有 assistant 消息可以播放
   if (props.message.role !== 'assistant') return false
   if (!copyableContent.value) return false
-  // OpenAI / Custom / Edge / MiMo 不依赖浏览器 Web Speech API
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo') return true
+  // OpenAI / Custom / Edge / MiMo / Doubao 不依赖浏览器 Web Speech API
+  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') return true
   return speech.isSupported
 })
 
 const isPlayingThisMessage = computed(() => {
-  // OpenAI / Custom / Edge / MiMo 模式
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo') {
+  // OpenAI / Custom / Edge / MiMo / Doubao 模式
+  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') {
     return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPlaying.value
   }
   return speech.currentMessageId.value === props.message.id && speech.isPlaying.value
 })
 
 const isPausedThisMessage = computed(() => {
-  // OpenAI / Custom / Edge / MiMo 模式
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo') {
+  // OpenAI / Custom / Edge / MiMo / Doubao 模式
+  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') {
     return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPaused.value
   }
   return speech.currentMessageId.value === props.message.id && speech.isPaused.value
@@ -659,6 +779,17 @@ function handleSpeechToggle() {
     return
   }
 
+  if (voiceSettings.provider.value === 'doubao') {
+    speech.openaiToggle(props.message.id, content, {
+      provider: 'doubao',
+      baseUrl: voiceSettings.doubaoBaseUrl.value,
+      model: voiceSettings.doubaoModel.value,
+      voice: voiceSettings.doubaoVoice.value,
+      stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
+    })
+    return
+  }
+
   // Web Speech API 模式
   if (voiceSettings.provider.value === 'webspeech') {
     speech.toggleBrowser(props.message.id, content, {
@@ -722,6 +853,14 @@ onMounted(() => {
           voiceCloneFormat: voiceSettings.mimoVoiceCloneFormat.value,
           stylePrompt: voiceSettings.mimoStylePrompt.value || undefined,
         }).catch(handleAutoplayTtsError)
+      } else if (voiceSettings.provider.value === 'doubao') {
+        void speech.openaiPlay(props.message.id, content, {
+          provider: 'doubao',
+          baseUrl: voiceSettings.doubaoBaseUrl.value,
+          model: voiceSettings.doubaoModel.value,
+          voice: voiceSettings.doubaoVoice.value,
+          stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
+        }).catch(handleAutoplayTtsError)
       } else if (voiceSettings.provider.value === 'webspeech') {
         const text = speech.extractReadableText(content)
         if (text) {
@@ -752,11 +891,12 @@ onBeforeUnmount(() => {
 <template>
   <div
     class="message"
-    :class="[message.role, { highlight }]"
+    :class="[message.role, { highlight, 'tool-change-message': hasToolChange }]"
     :id="`message-${message.id}`"
   >
     <template v-if="message.role === 'tool'">
       <div
+        v-if="!hasToolChange"
         class="tool-line"
         :class="{ expandable: hasToolDetails }"
         @click="hasToolDetails && (toolExpanded = !toolExpanded)"
@@ -802,7 +942,64 @@ onBeforeUnmount(() => {
           t("chat.error")
         }}</span>
       </div>
-      <div v-if="toolExpanded && hasToolDetails" class="tool-details" @click="handleToolDetailClick">
+      <div
+        v-if="hasToolChange"
+        class="tool-detail-section tool-change-standalone"
+        @click="handleToolDetailClick"
+      >
+        <div class="tool-change-card">
+          <button
+            class="tool-change-card-header"
+            type="button"
+            :aria-expanded="toolExpanded"
+            @click.stop="toolExpanded = !toolExpanded"
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              class="tool-change-chevron"
+              :class="{ rotated: toolExpanded }"
+            >
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+            <span class="tool-change-card-title">
+              {{ t("chat.changedFiles", { files: toolChange?.files_changed || 0 }) }}
+            </span>
+            <span class="tool-change-card-stats">
+              <span class="additions">+{{ toolChange?.additions || 0 }}</span>
+              <span class="deletions">-{{ toolChange?.deletions || 0 }}</span>
+            </span>
+          </button>
+          <div v-if="toolExpanded" class="tool-change-files">
+            <button
+              v-for="file in toolChange?.files || []"
+              :key="file.id"
+              class="tool-change-file-row"
+              :class="{ selected: selectedToolChangeFileId === file.id }"
+              type="button"
+              @click.stop="openToolChangeFile(file)"
+            >
+              <span class="tool-change-file-main">
+                <span class="tool-change-file-badge" :class="fileBadgeClass(file.path)">
+                  {{ fileExtension(file.path) }}
+                </span>
+                <span class="tool-change-file-name" :title="file.path">
+                  {{ fileNameFromPath(file.path) }}
+                </span>
+              </span>
+              <span class="tool-change-file-stats">
+                <span class="additions">+{{ file.additions }}</span>
+                <span class="deletions">-{{ file.deletions }}</span>
+              </span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div v-else-if="toolExpanded && hasToolDetails" class="tool-details" @click="handleToolDetailClick">
         <div v-if="formattedToolArgs" class="tool-detail-section" data-copy-source="tool-args">
           <div class="tool-detail-label">{{ t("chat.arguments") }}</div>
           <div class="tool-detail-code-block" v-html="renderedToolArgs"></div>
@@ -1019,12 +1216,66 @@ onBeforeUnmount(() => {
                 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
               </svg>
             </button>
+            <button
+              v-if="showForkAction"
+              class="fork-bubble-btn"
+              @click="forkFromCurrentTail"
+              :title="t('chat.slashCommands.fork')"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="6" cy="5" r="2.25" />
+                <circle cx="18" cy="5" r="2.25" />
+                <circle cx="12" cy="19" r="2.25" />
+                <path d="M6 7.25v2.25a4 4 0 0 0 4 4h4a4 4 0 0 0 4-4V7.25" />
+                <path d="M12 13.5v3.25" />
+              </svg>
+            </button>
             <span class="message-time">{{ timeStr }}</span>
           </div>
         </div>
       </div>
     </template>
   </div>
+  <NDrawer
+    :show="toolChangeDrawerVisible"
+    placement="right"
+    width="min(760px, 100vw)"
+    @update:show="value => { if (!value) closeToolChangeDrawer(); else toolChangeDrawerVisible = value }"
+  >
+    <NDrawerContent
+      header-class="tool-change-drawer-header"
+      body-content-class="tool-change-drawer-body-content"
+      :title="selectedToolChangeFileName || t('chat.workspaceChanges')"
+      closable
+    >
+      <div class="tool-change-drawer">
+        <div class="tool-change-drawer-actions">
+          <NButton
+            size="small"
+            :type="toolChangeDrawerMode === 'edit' ? 'primary' : 'default'"
+            :disabled="toolChangeDrawerFile?.binary"
+            :loading="isLoadingToolChangePatch && toolChangeDrawerMode === 'diff'"
+            @click="editSelectedToolChangeFile"
+          >
+            {{ t("common.edit") }}
+          </NButton>
+        </div>
+        <div v-if="selectedToolChangeAbsolutePath" class="tool-change-drawer-path">
+          {{ selectedToolChangeAbsolutePath }}
+        </div>
+        <NSpin v-if="isLoadingToolChangePatch" class="tool-change-drawer-spin" />
+        <FileEditor
+          v-else-if="toolChangeDrawerMode === 'edit' && filesStore.editingFile"
+          :custom-close="closeToolChangeEditor"
+        />
+        <div
+          v-else-if="selectedToolChangePatch"
+          class="tool-detail-code-block tool-change-drawer-diff"
+          v-html="renderedToolChangePatch"
+        ></div>
+      </div>
+    </NDrawerContent>
+  </NDrawer>
   <Teleport to="body">
     <div v-if="previewUrl" class="image-preview-overlay" @click.self="previewUrl = null">
       <img :src="previewUrl" class="image-preview-img" @click="previewUrl = null" />
@@ -1093,6 +1344,10 @@ onBeforeUnmount(() => {
 
   &.tool {
     align-items: flex-start;
+
+    &.tool-change-message {
+      max-width: 100%;
+    }
   }
 
   &.system {
@@ -1433,7 +1688,8 @@ onBeforeUnmount(() => {
 }
 
 .copy-bubble-btn,
-.speech-bubble-btn {
+.speech-bubble-btn,
+.fork-bubble-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1531,6 +1787,7 @@ onBeforeUnmount(() => {
     white-space: nowrap;
     max-width: min(400px, 100%);
   }
+
 }
 
 .tool-chevron {
@@ -1573,6 +1830,12 @@ onBeforeUnmount(() => {
   margin-bottom: 6px;
 }
 
+.tool-change-standalone {
+  max-width: 100%;
+  min-width: min(760px, calc(100vw - 40px));
+  width: min(900px, calc(100vw - 40px));
+}
+
 .tool-detail-label {
   font-size: 10px;
   font-weight: 600;
@@ -1605,6 +1868,253 @@ onBeforeUnmount(() => {
     white-space: pre;
     word-break: normal;
   }
+}
+
+.tool-change-card {
+  background: $bg-secondary;
+  border: 1px solid $border-light;
+  border-radius: 10px;
+  color: $text-primary;
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  width: 100%;
+
+  .dark & {
+    background: #1f1f1f;
+    border-color: rgba(255, 255, 255, 0.14);
+    color: #f2f2f2;
+  }
+}
+
+.tool-change-card-header {
+  align-items: baseline;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-start;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+  width: 100%;
+}
+
+.tool-change-chevron {
+  align-self: center;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+
+  &.rotated {
+    transform: rotate(90deg);
+  }
+}
+
+.tool-change-files {
+  display: grid;
+  gap: 10px;
+}
+
+.tool-change-card-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.tool-change-card-stats,
+.tool-change-file-stats {
+  display: inline-flex;
+  flex-shrink: 0;
+  font-family: $font-code;
+  font-size: 12px;
+  gap: 6px;
+
+  .additions {
+    color: #00e676;
+  }
+
+  .deletions {
+    color: #ff3b58;
+  }
+}
+
+.tool-change-file-row {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: $text-primary;
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 4px 0;
+  text-align: left;
+
+  &:hover,
+  &.selected {
+    .tool-change-file-name {
+      color: $text-primary;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+  }
+
+  .dark & {
+    color: #f2f2f2;
+
+    &:hover,
+    &.selected {
+      .tool-change-file-name {
+        color: #ffffff;
+      }
+    }
+  }
+}
+
+.tool-change-file-main {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tool-change-file-badge {
+  align-items: center;
+  border-radius: 2px;
+  display: inline-flex;
+  flex: 0 0 13px;
+  font-family: $font-code;
+  font-size: 7px;
+  font-weight: 700;
+  height: 13px;
+  justify-content: center;
+  line-height: 1;
+  overflow: hidden;
+  text-transform: uppercase;
+  width: 13px;
+
+  &.script {
+    background: #f7df1e;
+    color: #1f1f1f;
+  }
+
+  &.dynamic {
+    background: #3776ab;
+    color: #ffffff;
+  }
+
+  &.jvm {
+    background: #f0642f;
+    color: #ffffff;
+  }
+
+  &.systems {
+    background: #5e63b6;
+    color: #ffffff;
+  }
+
+  &.markup {
+    background: #e34f26;
+    color: #ffffff;
+  }
+
+  &.style {
+    background: #8b5cf6;
+    color: #ffffff;
+  }
+
+  &.data {
+    background: #64748b;
+    color: #ffffff;
+  }
+
+  &.doc {
+    background: #0f766e;
+    color: #ffffff;
+  }
+
+  &.shell {
+    background: #111827;
+    color: #ffffff;
+  }
+
+  &.default {
+    background: #6b7280;
+    color: #ffffff;
+  }
+}
+
+.tool-change-file-name {
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-change-loading {
+  color: $text-muted;
+  font-size: 11px;
+}
+
+.tool-change-drawer-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.tool-change-drawer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.tool-change-drawer-path {
+  color: $text-muted;
+  flex: 0 0 auto;
+  font-family: $font-code;
+  font-size: 11px;
+  margin-top: 10px;
+  overflow: hidden;
+  padding: 0 0 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-change-drawer-spin {
+  align-self: center;
+  margin-top: 24px;
+}
+
+.tool-change-drawer-diff {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+
+  :deep(.hljs-code-block),
+  :deep(pre),
+  :deep(code.hljs),
+  :deep(.hljs.language-diff) {
+    height: 100%;
+    max-height: none;
+  }
+
+  :deep(code.hljs),
+  :deep(.hljs.language-diff) {
+    overflow: auto;
+  }
+}
+
+:deep(.n-drawer-body-content-wrapper) {
+  height: 100%;
+}
+
+:deep(.tool-change-drawer .file-editor) {
+  height: 100%;
+  min-height: 0;
 }
 
 @keyframes spin {
@@ -1693,6 +2203,21 @@ onBeforeUnmount(() => {
 
   .message.system .msg-body {
     max-width: 100%;
+  }
+
+  .tool-change-standalone {
+    min-width: 0;
+    width: calc(100vw - 24px);
+  }
+
+  :global(.tool-change-drawer-header) {
+    padding-left: 12px !important;
+    padding-right: 12px !important;
+  }
+
+  :global(.tool-change-drawer-body-content) {
+    padding-left: 8px !important;
+    padding-right: 8px !important;
   }
 }
 </style>

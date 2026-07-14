@@ -70,7 +70,7 @@ function handleContextMenu(e: MouseEvent, entry: FileEntry) {
 
 async function handleDownload(entry: FileEntry) {
   try {
-    await downloadFile(entry.path, entry.name)
+    await downloadFile(entry.path, entry.name, filesStore.currentProfile)
   } catch (err: any) {
     message.error(err.message || t('files.backendError'))
   }
@@ -106,14 +106,14 @@ async function handleDownload(entry: FileEntry) {
         >
           <div class="file-name">
             <span class="file-icon">{{ getFileIcon(entry) }}</span>
-            <span class="file-label">{{ entry.name }}</span>
+            <span class="file-label" :title="entry.name">{{ entry.name }}</span>
           </div>
           <div class="file-size">{{ entry.isDir ? '—' : formatSize(entry.size) }}</div>
           <div class="file-date">{{ formatDate(entry.modTime) }}</div>
           <div class="file-actions">
             <NButton v-if="isPreviewableFile(entry.name) && !entry.isDir" size="tiny" quaternary @click.stop="handlePreview(entry)" :title="t('files.preview')">👁️</NButton>
             <NButton v-if="isTextFile(entry.name) && !entry.isDir" size="tiny" quaternary @click.stop="filesStore.openEditor(entry.path)" :title="t('files.edit')">✏️</NButton>
-            <NButton v-if="!entry.isDir" size="tiny" quaternary @click.stop="handleDownload(entry)" :title="t('files.download')">⬇️</NButton>
+            <NButton v-if="!filesStore.currentWorkspaceSessionId && !entry.isDir" size="tiny" quaternary @click.stop="handleDownload(entry)" :title="t('files.download')">⬇️</NButton>
           </div>
         </div>
       </div>

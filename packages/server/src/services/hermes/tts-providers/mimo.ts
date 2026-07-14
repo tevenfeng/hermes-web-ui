@@ -74,16 +74,7 @@ function buildMessages(text: string, opts: MimoTtsProviderOptions) {
     return [
       {
         role: 'user',
-        content: [
-          { type: 'text', text: opts.stylePrompt || '' },
-          {
-            type: 'input_audio',
-            input_audio: {
-              data: opts.voiceCloneDataUri,
-              format: opts.voiceCloneFormat || 'wav',
-            },
-          },
-        ],
+        content: opts.stylePrompt || '',
       },
       {
         role: 'assistant',
@@ -111,14 +102,25 @@ function buildMessages(text: string, opts: MimoTtsProviderOptions) {
 function buildAudio(opts: MimoTtsProviderOptions): Record<string, string> {
   const mode = inferVoiceMode(opts)
   const audio: Record<string, string> = {
-    format: 'wav',
+    format: opts.format || 'wav',
   }
 
   if (mode === 'preset' && opts.voice) {
     audio.voice = opts.voice
+  } else if (mode === 'voiceClone' && opts.voiceCloneDataUri) {
+    audio.voice = opts.voiceCloneDataUri
   }
 
   return audio
+}
+
+function audioContentType(format: string | undefined): string {
+  const normalized = String(format || 'wav').trim().toLowerCase().replace('-', '_')
+  if (normalized === 'pcm' || normalized === 'raw' || normalized === 's16le') return 'audio/x-pcm'
+  if (normalized === 'mp3' || normalized === 'mpeg') return 'audio/mpeg'
+  if (normalized === 'opus' || normalized === 'ogg' || normalized === 'ogg_opus') return 'audio/ogg'
+  if (normalized === 'flac') return 'audio/flac'
+  return 'audio/wav'
 }
 
 export const mimoTtsProvider: MimoTtsProvider = {
@@ -155,7 +157,7 @@ export const mimoTtsProvider: MimoTtsProvider = {
 
     return {
       audio: Buffer.from(audioBase64, 'base64'),
-      contentType: 'audio/wav',
+      contentType: audioContentType(opts.format),
       engine: 'mimo',
       provider: 'mimo',
     }

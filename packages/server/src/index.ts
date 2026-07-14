@@ -5,7 +5,7 @@ import bodyParser from '@koa/bodyparser'
 import serve from 'koa-static'
 import send from 'koa-send'
 import os from 'os'
-import { resolve } from 'path'
+import { relative, resolve } from 'path'
 import { mkdir } from 'fs/promises'
 import { readFileSync } from 'fs'
 import { config, shouldCreateWebUiDataDir } from './config'
@@ -26,8 +26,12 @@ import { ensureProfileGatewaysRunning } from './services/hermes/gateway-autostar
 import { refreshConfiguredProviderModelCatalogsInBackground } from './services/hermes/model-catalog-cache'
 import { scanLanDevices, startLanDiscoveryResponder } from './services/lan-discovery'
 import { getLanPeerSocketManager, getLanPeerSocketPath } from './services/lan-peer-socket'
+import { startGlobalAgentServer } from './services/global-agent/server'
+import { WorkflowSocketServer } from './services/workflow-socket'
+import { PetStateSocketServer } from './services/hermes/pet-state-socket'
 import { logger } from './services/logger'
 import { createStaticCompressionMiddleware } from './middleware/static-compression'
+import { getStaticCacheControl, SPA_ENTRY_CACHE_CONTROL } from './middleware/static-cache'
 import { requireUserJwt, resolveUserProfile } from './middleware/user-auth'
 import { createCorsOriginResolver, securityHeaders } from './security'
 import type { ShutdownHandler } from './services/shutdown'
@@ -55,6 +59,8 @@ process.on('unhandledRejection', (reason) => {
 let server: any = null
 let servers: any[] = []
 let chatRunServer: any = null
+let workflowSocketServer: WorkflowSocketServer | null = null
+let petStateSocketServer: PetStateSocketServer | null = null
 let agentBridgeManager: any = null
 let desktopShutdownHandler: ShutdownHandler | null = null
 
@@ -76,6 +82,12 @@ async function listenWithFallback(app: Koa, port: number, host?: string): Promis
   console.log(`[bootstrap] listening on ${bindHost}:${port}`)
   const primary = await listen(app, port, bindHost)
   return { primary, servers: [primary] }
+}
+
+function getLoopbackBaseUrl(httpServer: any): string {
+  const address = httpServer?.address?.()
+  const port = typeof address === 'object' && address?.port ? address.port : config.port
+  return `http://127.0.0.1:${port}`
 }
 
 /**
@@ -293,19 +305,24 @@ export async function bootstrap() {
   registerDesktopShutdownRoute(app)
 
   // Register all routes (handles auth internally)
-  const proxyMiddleware = registerRoutes(app, [requireUserJwt, resolveUserProfile])
-  app.use(proxyMiddleware)
+  registerRoutes(app, [requireUserJwt, resolveUserProfile])
   console.log('[bootstrap] routes registered')
 
   // SPA fallback
   const distDir = resolve(__dirname, '..', 'client')
   app.use(createStaticCompressionMiddleware())
-  app.use(serve(distDir))
+  app.use(serve(distDir, {
+    setHeaders(res, filePath) {
+      const cacheControl = getStaticCacheControl(relative(distDir, filePath))
+      if (cacheControl) res.setHeader('Cache-Control', cacheControl)
+    },
+  }))
   app.use(async (ctx) => {
     if (!ctx.path.startsWith('/api') &&
       ctx.path !== '/health' &&
       ctx.path !== '/upload' &&
       ctx.path !== '/webhook') {
+      ctx.set('Cache-Control', SPA_ENTRY_CACHE_CONTROL)
       await send(ctx, 'index.html', { root: distDir })
     }
   })
@@ -330,6 +347,16 @@ export async function bootstrap() {
   chatRunServer = new ChatRunSocket(groupChatServer.getIO())
   setChatRunServer(chatRunServer)
   chatRunServer.init()
+
+  workflowSocketServer = new WorkflowSocketServer(groupChatServer.getIO())
+  workflowSocketServer.init()
+
+  petStateSocketServer = new PetStateSocketServer(groupChatServer.getIO())
+  petStateSocketServer.init()
+
+  const loopbackBaseUrl = getLoopbackBaseUrl(server)
+  startGlobalAgentServer(groupChatServer.getIO(), { localBaseUrl: loopbackBaseUrl })
+  console.log('[bootstrap] global agent server ready')
 
   // Session deleter — periodically drain pending session deletes
   const { SessionDeleter } = await import('./services/hermes/session-deleter')

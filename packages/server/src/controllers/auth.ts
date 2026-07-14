@@ -11,6 +11,7 @@ import {
   findUserById,
   findUserByUsername,
   getUserAvatar,
+  listUserProfiles,
   listUsers,
   setUserAvatar,
   updateUser,
@@ -18,10 +19,15 @@ import {
   updateUserPassword,
   verifyPassword,
   type UserRole,
+  type UserRecord,
   type UserStatus,
 } from '../db/hermes/users-store'
 import { issueUserJwt } from '../middleware/user-auth'
 import { listProfileNamesFromDisk } from '../services/hermes/hermes-profile'
+import { startOutboundRelayClient, stopOutboundRelayClient } from '../services/global-agent/outbound-relay-client'
+import { getLanEndpointKind } from '../services/lan-discovery'
+import { getPublicSystemInfo } from '../services/system-info'
+import { config } from '../config'
 
 /**
  * GET /api/auth/status
@@ -156,6 +162,47 @@ export async function updateMyAvatar(ctx: Context) {
   ctx.body = { success: true, avatar: validation.json }
 }
 
+async function passwordLogin(
+  ctx: Context,
+  username: string,
+  password: string,
+): Promise<{ ok: true; token: string; user: UserRecord } | { ok: false }> {
+  const ip = extractIp(ctx)
+  const result = checkPassword(ip)
+  if (!result.allowed) {
+    ctx.status = result.status
+    ctx.body = { error: 'Too many login attempts, please try again later' }
+    return { ok: false }
+  }
+
+  const existingUserCount = countUsers()
+  const user = existingUserCount === 0
+    ? bootstrapDefaultSuperAdmin(username, password)
+    : findUserByUsername(username)
+
+  if (!user || user.status !== 'active' || (existingUserCount > 0 && !verifyPassword(password, user.password_hash))) {
+    recordPasswordFailure(ip)
+    ctx.status = 401
+    ctx.body = { error: 'Invalid username or password' }
+    return { ok: false }
+  }
+
+  try {
+    const token = await issueUserJwt(user)
+    recordPasswordSuccess(ip)
+    return { ok: true, token, user }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err?.message || 'Failed to issue login token' }
+    return { ok: false }
+  }
+}
+
+function accessibleProfileNames(user: UserRecord): string[] {
+  if (user.role === 'super_admin') return listProfileNamesFromDisk()
+  return listUserProfiles(user.id).map(profile => profile.profile_name)
+}
+
 /**
  * POST /api/auth/login
  * Authenticate with username/password (public).
@@ -169,37 +216,153 @@ export async function login(ctx: Context) {
     return
   }
 
-  const ip = extractIp(ctx)
-  const result = checkPassword(ip)
-  if (!result.allowed) {
-    ctx.status = result.status
-    ctx.body = { error: 'Too many login attempts, please try again later' }
-    return
-  }
+  const result = await passwordLogin(ctx, username, password)
+  if (!result.ok) return
+  ctx.body = { token: result.token }
+}
 
-  const existingUserCount = countUsers()
-  const user = existingUserCount === 0
-    ? bootstrapDefaultSuperAdmin(username, password)
-    : findUserByUsername(username)
-
-  if (!user || user.status !== 'active' || (existingUserCount > 0 && !verifyPassword(password, user.password_hash))) {
-    recordPasswordFailure(ip)
-    ctx.status = 401
-    ctx.body = { error: 'Invalid username or password' }
-    return
-  }
-
-  let token: string
+function normalizeRelayUrl(input: string): string | null {
   try {
-    token = await issueUserJwt(user)
-  } catch (err: any) {
-    ctx.status = 500
-    ctx.body = { error: err?.message || 'Failed to issue login token' }
+    const url = new URL(input)
+    if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) return null
+    url.username = ''
+    url.password = ''
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function requestBaseUrl(ctx: Context): string | undefined {
+  const host = ctx.get('host').trim()
+  if (!host) return undefined
+  return `${ctx.protocol || 'http'}://${host}`
+}
+
+async function verifyRemoteRelayDeviceCode(deviceCode: string): Promise<boolean> {
+  const url = `${config.remoteRelay.url.replace(/\/$/, '')}/global-agent/device/${encodeURIComponent(deviceCode)}`
+  const response = await fetch(url, { method: 'GET' })
+  return response.ok
+}
+
+async function localRelayMachineInfo(url: string) {
+  const info = await getPublicSystemInfo()
+  return {
+    ...info,
+    http_port: config.port,
+    endpoint_kind: getLanEndpointKind(config.port),
+    url,
+    relay_url: config.remoteRelay.url,
+  }
+}
+
+/**
+ * POST /api/auth/mcu-login
+ * Authenticate with the existing username/password login for an MCU/device.
+ * When remote relay is requested or a legacy relay URL is provided, connect this Hermes Studio instance to it.
+ * Body: { token, id, account, password, url? }.
+ */
+export async function microcontrollerLogin(ctx: Context) {
+  const {
+    token: relayToken,
+    url,
+    id,
+    account,
+    password,
+    relayMode,
+    remote,
+    device_code: deviceCode,
+  } = ctx.request.body as {
+    token?: string
+    url?: string
+    id?: string
+    account?: string
+    password?: string
+    relayMode?: string
+    remote?: boolean
+    device_code?: string
+  }
+
+  if (!relayToken || !id || !account || !password) {
+    ctx.status = 400
+    ctx.body = { error: 'token, id, account and password are required' }
     return
   }
 
-  recordPasswordSuccess(ip)
-  ctx.body = { token }
+  const wantsRemoteRelay = relayMode === 'remote' || remote === true
+  const remoteRelayUrl = wantsRemoteRelay ? config.remoteRelay.url : ''
+  const relayUrl = typeof url === 'string' && url.trim()
+    ? normalizeRelayUrl(url)
+    : remoteRelayUrl || null
+  if (url && !relayUrl) {
+    ctx.status = 400
+    ctx.body = { error: 'url must be a valid http, https, ws, or wss URL' }
+    return
+  }
+
+  const normalizedDeviceCode = typeof deviceCode === 'string' ? deviceCode.trim() : ''
+  if (wantsRemoteRelay && !normalizedDeviceCode) {
+    ctx.status = 400
+    ctx.body = { error: '缺少设备码' }
+    return
+  }
+
+  const result = await passwordLogin(ctx, account, password)
+  if (!result.ok) return
+
+  if (wantsRemoteRelay) {
+    try {
+      if (!await verifyRemoteRelayDeviceCode(normalizedDeviceCode)) {
+        ctx.status = 403
+        ctx.body = { error: '非官方设备码' }
+        return
+      }
+    } catch (err: any) {
+      ctx.status = 502
+      ctx.body = { error: err?.message || '远程设备码校验失败' }
+      return
+    }
+  }
+
+  const connectionId = id.trim()
+  const forwardedRemoteMcuLogin = wantsRemoteRelay && ctx.get('x-hermes-relay-forwarded') === 'mcu-socket.io'
+  if (!forwardedRemoteMcuLogin) {
+    stopOutboundRelayClient(connectionId)
+  }
+  if (relayUrl && !forwardedRemoteMcuLogin) {
+    const relayStartUrl = wantsRemoteRelay && relayUrl === remoteRelayUrl
+      ? config.remoteRelay.url
+      : relayUrl
+    const localBaseUrl = requestBaseUrl(ctx)
+    const machineInfo = localBaseUrl ? await localRelayMachineInfo(localBaseUrl) : undefined
+    const client = startOutboundRelayClient({
+      connectionId,
+      relayUrl: relayStartUrl,
+      relayToken,
+      userToken: result.token,
+      instanceId: connectionId,
+      ...(normalizedDeviceCode ? { deviceCode: normalizedDeviceCode } : {}),
+      ...(localBaseUrl ? { localBaseUrl } : {}),
+      ...(machineInfo ? { machineInfo } : {}),
+      relayProtocol: wantsRemoteRelay ? 'mcu-socket.io' : 'socket.io',
+    })
+    if (!client) {
+      ctx.status = 400
+      ctx.body = { error: 'Failed to start relay client' }
+      return
+    }
+  }
+
+  ctx.body = {
+    token: result.token,
+    profiles: accessibleProfileNames(result.user),
+    relay: {
+      connected: Boolean(relayUrl),
+      id: connectionId,
+      ...(wantsRemoteRelay && relayUrl === remoteRelayUrl ? { remote: true } : {}),
+      ...(relayUrl ? { url: relayUrl } : {}),
+    },
+  }
 }
 
 /**

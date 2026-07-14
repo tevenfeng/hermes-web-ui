@@ -1,7 +1,7 @@
 import * as esbuild from 'esbuild'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { chmodSync, cpSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs'
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf-8'))
@@ -38,6 +38,16 @@ for (const fileName of readdirSync(bridgeSrcDir)) {
 }
 chmodSync(resolve(bridgeOutDir, 'hermes_bridge.py'), 0o755)
 
+const serverAssetsSrcDir = resolve(rootDir, 'packages/server/src/assets')
+if (existsSync(serverAssetsSrcDir)) {
+  cpSync(serverAssetsSrcDir, resolve(serverOutDir, 'assets'), { recursive: true })
+}
+
+cpSync(
+  resolve(rootDir, 'docs/openapi.json'),
+  resolve(serverOutDir, 'openapi.json'),
+)
+
 const skillsOutDir = resolve(rootDir, 'dist/skills')
 rmSync(skillsOutDir, { recursive: true, force: true })
 cpSync(
@@ -45,3 +55,34 @@ cpSync(
   skillsOutDir,
   { recursive: true },
 )
+
+const firmwareOutDir = resolve(rootDir, 'dist/mcu')
+const legacyFirmwareOutPath = resolve(firmwareOutDir, 'firmware.bin')
+for (const firmwareVersion of ['v1', 'v2']) {
+  const firmwareBuildSrc = resolve(rootDir, `packages/esp32-c3/${firmwareVersion}/.pio/build/esp32-c3-devkitm-1/firmware.bin`)
+  const firmwareReleaseSrc = resolve(rootDir, `packages/esp32-c3/release/${firmwareVersion}/firmware.bin`)
+  const firmwareVersionedOutDir = resolve(firmwareOutDir, firmwareVersion)
+  const firmwareOutPath = resolve(firmwareVersionedOutDir, 'firmware.bin')
+  let firmwareSrc = ''
+  let sourceLabel = ''
+
+  if (existsSync(firmwareBuildSrc)) {
+    mkdirSync(dirname(firmwareReleaseSrc), { recursive: true })
+    cpSync(firmwareBuildSrc, firmwareReleaseSrc)
+    firmwareSrc = firmwareBuildSrc
+    sourceLabel = 'PlatformIO build output'
+  } else if (existsSync(firmwareReleaseSrc)) {
+    firmwareSrc = firmwareReleaseSrc
+    sourceLabel = 'release artifact'
+  }
+
+  if (!firmwareSrc) {
+    console.warn(`[build-server] ESP32-C3 ${firmwareVersion} firmware not found, skipped dist/mcu/${firmwareVersion}/firmware.bin`)
+    continue
+  }
+
+  mkdirSync(firmwareVersionedOutDir, { recursive: true })
+  cpSync(firmwareSrc, firmwareOutPath)
+  if (firmwareVersion === 'v1') cpSync(firmwareSrc, legacyFirmwareOutPath)
+  console.log(`[build-server] ESP32-C3 ${firmwareVersion} firmware copied from ${sourceLabel}`)
+}

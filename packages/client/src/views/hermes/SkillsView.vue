@@ -1,20 +1,19 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { NBadge, NButton, NDrawer, NDrawerContent, NInput } from 'naive-ui'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { NBadge, NButton, NDrawer, NDrawerContent, NInput, NSelect } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import SkillList from '@/components/hermes/skills/SkillList.vue'
 import SkillDetail from '@/components/hermes/skills/SkillDetail.vue'
 import SkillImportModal from '@/components/hermes/skills/SkillImportModal.vue'
 import SkillExternalDirsModal from '@/components/hermes/skills/SkillExternalDirsModal.vue'
 import PendingWriteApprovals from '@/components/hermes/skills/PendingWriteApprovals.vue'
-import MarkdownRenderer from '@/components/hermes/chat/MarkdownRenderer.vue'
-import { fetchSkills, type SkillCategory, type SkillSource, type SkillInfo } from '@/api/hermes/skills'
+import { fetchSkills, type SkillCategory, type SkillSource, type SkillInfo, type SkillTarget } from '@/api/hermes/skills'
 import { fetchPendingWrites } from '@/api/hermes/write-gate'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 
 type SourceFilter = SkillSource | 'modified'
 
-const { t, locale } = useI18n()
+const { t } = useI18n()
 const profilesStore = useProfilesStore()
 const categories = ref<SkillCategory[]>([])
 const archived = ref<SkillInfo[]>([])
@@ -24,20 +23,13 @@ const selectedSkill = ref('')
 const searchQuery = ref('')
 const showSidebar = ref(true)
 const sourceFilter = ref<SourceFilter | null>(null)
-const recommendations = ref('')
+const skillTarget = ref<SkillTarget>('hermes')
 const showImportModal = ref(false)
 const showExternalDirsModal = ref(false)
 const showWriteApprovalDrawer = ref(false)
 const pendingWriteCount = ref(0)
 const writeApprovalSupported = ref(true)
 let mobileQuery: MediaQueryList | null = null
-let recommendationsRequestSeq = 0
-
-const recommendationsPath = computed(() => {
-  return String(locale.value).startsWith('zh')
-    ? '/skill-recommendations.zh.md'
-    : '/skill-recommendations.en.md'
-})
 
 const selectedSkillData = computed(() => {
   if (!selectedCategory.value || !selectedSkill.value) return null
@@ -46,6 +38,19 @@ const selectedSkillData = computed(() => {
   }
   const cat = categories.value.find(c => c.name === selectedCategory.value)
   return cat?.skills.find(s => s.name === selectedSkill.value) ?? null
+})
+
+const skillTargetOptions = computed(() => [
+  { label: t('skills.targets.hermes'), value: 'hermes' },
+  { label: t('skills.targets.claude'), value: 'claude' },
+  { label: t('skills.targets.codex'), value: 'codex' },
+])
+
+const isHermesTarget = computed(() => skillTarget.value === 'hermes')
+const selectedSkillReadonly = computed(() => {
+  if (!selectedSkillData.value) return true
+  if (selectedCategory.value === '.archive') return true
+  return (selectedSkillData.value.source || 'local') !== 'local'
 })
 
 function handleMobileChange(e: MediaQueryListEvent | MediaQueryList) {
@@ -57,7 +62,6 @@ onMounted(() => {
   handleMobileChange(mobileQuery)
   mobileQuery.addEventListener('change', handleMobileChange)
   loadSkills()
-  loadRecommendations()
   loadPendingWriteCount()
 })
 
@@ -71,9 +75,10 @@ async function loadSkills() {
     if (!profilesStore.activeProfileName || profilesStore.profiles.length === 0) {
       await profilesStore.fetchProfiles()
     }
-    const data = await fetchSkills()
+    const data = await fetchSkills(undefined, skillTarget.value)
     categories.value = data.categories
     archived.value = data.archived
+    ensureSelectedSkill()
   } catch (err: any) {
     console.error('Failed to load skills:', err)
   } finally {
@@ -81,27 +86,13 @@ async function loadSkills() {
   }
 }
 
-async function loadRecommendations() {
-  const requestSeq = ++recommendationsRequestSeq
-  try {
-    const response = await fetch(recommendationsPath.value)
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const text = await response.text()
-    if (/^\s*<!doctype html/i.test(text) || /^\s*<html[\s>]/i.test(text)) {
-      throw new Error('Skill recommendations file was not found')
-    }
-    if (requestSeq === recommendationsRequestSeq) {
-      recommendations.value = text
-    }
-  } catch (err) {
-    if (requestSeq === recommendationsRequestSeq) {
-      recommendations.value = ''
-    }
-    console.error('Failed to load skill recommendations:', err)
-  }
+function handleTargetChange() {
+  selectedCategory.value = ''
+  selectedSkill.value = ''
+  sourceFilter.value = null
+  loadSkills()
+  if (skillTarget.value === 'hermes') loadPendingWriteCount()
 }
-
-watch(recommendationsPath, loadRecommendations)
 
 async function loadPendingWriteCount() {
   try {
@@ -113,14 +104,22 @@ async function loadPendingWriteCount() {
   }
 }
 
+function ensureSelectedSkill() {
+  const currentCategory = categories.value.find(c => c.name === selectedCategory.value)
+  if (currentCategory?.skills.some(s => s.name === selectedSkill.value)) return
+
+  const firstCategory = categories.value.find(c => c.skills.length > 0)
+  const firstSkill = firstCategory?.skills[0]
+  selectedCategory.value = firstCategory?.name || ''
+  selectedSkill.value = firstSkill?.name || ''
+}
+
 function toggleFilter(filter: SourceFilter) {
   sourceFilter.value = sourceFilter.value === filter ? null : filter
 }
 
 function handleSelect(category: string, skill: string) {
   if (selectedCategory.value === category && selectedSkill.value === skill) {
-    selectedCategory.value = ''
-    selectedSkill.value = ''
     return
   }
   selectedCategory.value = category
@@ -159,6 +158,10 @@ function handlePinToggled(name: string, pinned: boolean) {
     if (skill) skill.pinned = pinned
   }
 }
+
+function handleSkillSaved() {
+  loadSkills()
+}
 </script>
 
 <template>
@@ -189,7 +192,7 @@ function handlePinToggled(name: string, pinned: boolean) {
       </div>
       <div class="header-actions">
         <NButton
-          v-if="writeApprovalSupported"
+          v-if="isHermesTarget && writeApprovalSupported"
           class="header-action-btn"
           size="small"
           :title="t('skills.writeApprovalTitle')"
@@ -209,6 +212,7 @@ function handlePinToggled(name: string, pinned: boolean) {
           </span>
         </NButton>
         <NButton
+          v-if="isHermesTarget"
           class="header-action-btn"
           size="small"
           :title="t('skills.import')"
@@ -225,6 +229,7 @@ function handlePinToggled(name: string, pinned: boolean) {
           <span class="header-action-label">{{ t('skills.import') }}</span>
         </NButton>
         <NButton
+          v-if="isHermesTarget"
           class="header-action-btn"
           size="small"
           :title="t('skills.externalDirs.manage')"
@@ -270,12 +275,22 @@ function handlePinToggled(name: string, pinned: boolean) {
       <div v-else class="skills-layout">
           <div class="mobile-backdrop" :class="{ active: showSidebar }" @click="showSidebar = false" />
           <div v-if="showSidebar" class="skills-sidebar">
+            <div class="skills-target-filter">
+              <span class="target-filter-label">{{ t('skills.targetFilter') }}</span>
+              <NSelect
+                v-model:value="skillTarget"
+                size="small"
+                :options="skillTargetOptions"
+                @update:value="handleTargetChange"
+              />
+            </div>
             <SkillList
               :categories="categories"
               :archived="archived"
               :selected-skill="selectedCategory && selectedSkill ? `${selectedCategory}/${selectedSkill}` : null"
               :search-query="searchQuery"
               :source-filter="sourceFilter"
+              :readonly="!isHermesTarget"
               @select="handleSelect"
               @deleted="handleSkillDeleted"
             />
@@ -290,18 +305,19 @@ function handlePinToggled(name: string, pinned: boolean) {
               :use-count="selectedSkillData?.useCount"
               :view-count="selectedSkillData?.viewCount"
               :pinned="selectedSkillData?.pinned"
+              :target="skillTarget"
+              :readonly="selectedSkillReadonly"
+              :can-pin="isHermesTarget"
               @pin-toggled="handlePinToggled"
+              @saved="handleSkillSaved"
             />
-            <div v-else class="recommendations-panel">
-              <MarkdownRenderer v-if="recommendations" :content="recommendations" />
-              <div v-else class="empty-detail">
-                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2">
-                  <polygon points="12 2 2 7 12 12 22 7 12 2" />
-                  <polyline points="2 17 12 22 22 17" />
-                  <polyline points="2 12 12 17 22 12" />
-                </svg>
-                <span>{{ t('skills.noMatch') }}</span>
-              </div>
+            <div v-else class="empty-detail">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2">
+                <polygon points="12 2 2 7 12 12 22 7 12 2" />
+                <polyline points="2 17 12 22 22 17" />
+                <polyline points="2 12 12 17 22 12" />
+              </svg>
+              <span>{{ t('skills.noSkills') }}</span>
             </div>
           </div>
         </div>
@@ -331,6 +347,22 @@ function handlePinToggled(name: string, pinned: boolean) {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.skills-target-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 8px 10px;
+  border-bottom: 1px solid $border-light;
+}
+
+.target-filter-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: $text-muted;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
 }
 
 .legend-item {
@@ -506,14 +538,4 @@ function handlePinToggled(name: string, pinned: boolean) {
   font-size: 13px;
 }
 
-.recommendations-panel {
-  max-width: 920px;
-  margin: 0 auto;
-  padding: 4px 0 40px;
-
-  :deep(.markdown-body) {
-    font-size: 14px;
-    line-height: 1.7;
-  }
-}
 </style>

@@ -3,6 +3,7 @@ import { closeDb } from '../db'
 import { stopPreviewRuntime } from '../controllers/update'
 import { codingAgentRunManager } from './agent-runner/coding-agent-run-manager'
 import { shutdownManagedGateways } from './hermes/gateway-runner'
+import { stopOutboundRelayClient } from './global-agent/outbound-relay-client'
 
 const DEFAULT_SHUTDOWN_FORCE_EXIT_MS = 15_000
 const DEFAULT_DESKTOP_SHUTDOWN_FORCE_EXIT_MS = 15_000
@@ -19,15 +20,15 @@ export function getShutdownForceExitMs(): number {
   return desktop ? DEFAULT_DESKTOP_SHUTDOWN_FORCE_EXIT_MS : DEFAULT_SHUTDOWN_FORCE_EXIT_MS
 }
 
-export function shouldStopAgentBridgeOnShutdown(signal: string): boolean {
+export function shouldStopAgentBridgeOnShutdown(_signal: string): boolean {
   const raw = String(process.env.HERMES_AGENT_BRIDGE_STOP_ON_SHUTDOWN || '').trim().toLowerCase()
   if (['1', 'true', 'yes', 'on'].includes(raw)) return true
   if (['0', 'false', 'no', 'off'].includes(raw)) return false
 
-  // The CLI uses SIGUSR2 for an intentional Web UI restart so active bridge
-  // runs survive and can be reattached. SIGTERM/SIGINT represent real service
-  // shutdown and should stop the bridge broker/workers.
-  return signal !== 'SIGUSR2'
+  // Restart now defaults to a fresh bridge so package/runtime upgrades do not
+  // attach to stale brokers. Operators can opt back into restart resume with
+  // HERMES_AGENT_BRIDGE_STOP_ON_SHUTDOWN=0.
+  return true
 }
 
 export function shouldStopManagedGatewaysOnShutdown(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -84,12 +85,14 @@ export function createShutdownHandler(server: any, groupChatServer?: any, chatRu
         logger.info('Leaving agent bridge running across Web UI shutdown')
       }
 
-      // Close ChatRunSocket first to release WebSocket state. CLI bridge runs
-      // keep running in the external bridge and are reattached after restart.
+      // Close ChatRunSocket first to release WebSocket state.
       if (chatRunServer) {
         chatRunServer.close()
         logger.info('ChatRunSocket closed')
       }
+
+      stopOutboundRelayClient()
+      logger.info('Outbound relay clients closed')
 
       codingAgentRunManager.shutdown()
       logger.info('Coding agent hidden sessions closed')

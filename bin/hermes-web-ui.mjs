@@ -36,10 +36,20 @@ function envPositiveInt(name) {
   return Number.isFinite(value) && value > 0 ? value : undefined
 }
 
+function shouldPreserveBridgeOnShutdown() {
+  const raw = String(process.env.HERMES_AGENT_BRIDGE_STOP_ON_SHUTDOWN || '').trim().toLowerCase()
+  return ['0', 'false', 'no', 'off'].includes(raw)
+}
+
 function getDaemonStopGraceMs(options = {}) {
   const { restart = false } = options
-  if (restart) {
+  if (restart && shouldPreserveBridgeOnShutdown()) {
     return envPositiveInt('HERMES_WEB_UI_RESTART_GRACE_MS') ?? DEFAULT_RESTART_GRACE_MS
+  }
+  if (restart) {
+    return envPositiveInt('HERMES_WEB_UI_RESTART_GRACE_MS')
+      ?? envPositiveInt('HERMES_WEB_UI_STOP_GRACE_MS')
+      ?? DEFAULT_STOP_GRACE_MS
   }
   return envPositiveInt('HERMES_WEB_UI_STOP_GRACE_MS') ?? DEFAULT_STOP_GRACE_MS
 }
@@ -181,6 +191,16 @@ function getUpdatePort() {
 function getPort() {
   const argPort = getPortFromArgs()
   return argPort ?? DEFAULT_PORT
+}
+
+function shouldOpenBrowser(argv = process.argv) {
+  return !argv.includes('--no-open')
+}
+
+function getRestartArgs(port, argv = process.argv) {
+  const args = ['restart', '--port', String(port)]
+  if (!shouldOpenBrowser(argv)) args.push('--no-open')
+  return args
 }
 
 function enableClientMode() {
@@ -408,6 +428,7 @@ function startDaemon(port) {
     serverEnv.ComSpec = serverEnv.ComSpec?.trim() || windowsShell
   }
   const child = spawn(process.execPath, [serverEntry], {
+    cwd: pkgDir,
     detached: true,
     stdio: ['ignore', logStream, logStream],
     env: serverEnv,
@@ -451,9 +472,11 @@ function startDaemon(port) {
         console.log(`  ✓ hermes-web-ui started`)
         console.log(`    ${url}`)
         console.log(`    Log: ${LOG_FILE}`)
-        const isWin = process.platform === 'win32'
-        const cmd = isWin ? `start ${url}` : process.platform === 'darwin' ? `open ${url}` : `xdg-open ${url}`
-        try { execSync(cmd, { stdio: 'ignore' }) } catch {}
+        if (shouldOpenBrowser()) {
+          const isWin = process.platform === 'win32'
+          const cmd = isWin ? `start ${url}` : process.platform === 'darwin' ? `open ${url}` : `xdg-open ${url}`
+          try { execSync(cmd, { stdio: 'ignore' }) } catch {}
+        }
       } else if (waited < maxWait) {
         setTimeout(poll, interval)
       } else {
@@ -509,8 +532,9 @@ function stopDaemon(options = {}) {
   try {
     try {
       process.kill(pid, restart ? 'SIGUSR2' : 'SIGTERM')
-      // Restart keeps the bridge alive and should be quick. Stop waits longer
-      // so the server can ask the bridge broker to stop worker subprocesses.
+      // Restart uses a shorter grace window than stop. By default the server
+      // still shuts down the bridge; set HERMES_AGENT_BRIDGE_STOP_ON_SHUTDOWN=0
+      // to keep the bridge across restarts.
       const graceMs = getDaemonStopGraceMs({ restart })
       const attempts = Math.max(1, Math.ceil(graceMs / STOP_POLL_INTERVAL_MS))
       for (let i = 0; i < attempts; i++) {
@@ -655,6 +679,7 @@ Commands:
 Options:
   -v, --version      Show version number
   -h, --help         Show this help message
+  --no-open          Do not open a browser after startup
   --port <port>      Specify port (used with start/client/restart)
   --restart          Restart after clear-login-locks
 `)
@@ -710,6 +735,7 @@ Options:
         serverEnv.ComSpec = serverEnv.ComSpec?.trim() || windowsShell
       }
       const child = spawn(process.execPath, [serverEntry], {
+        cwd: pkgDir,
         stdio: 'inherit',
         env: serverEnv,
         windowsHide: true,
@@ -758,7 +784,7 @@ function runUpdateInstall(npm) {
         process.exit(1)
       }
 
-      const restart = spawnCli(cli, ['restart', '--port', String(getUpdatePort())], {
+      const restart = spawnCli(cli, getRestartArgs(getUpdatePort()), {
         stdio: 'inherit',
         windowsHide: true,
         env: getCurrentNodeEnv(),
@@ -787,7 +813,9 @@ export {
   commandExists,
   getDaemonStopGraceMs,
   getListeningPids,
+  getRestartArgs,
   parseUnixNetstatListeningPids,
   resetDefaultLogin,
+  shouldOpenBrowser,
   stopDaemon,
 }

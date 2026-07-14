@@ -8,9 +8,8 @@ import NousLoginModal from './NousLoginModal.vue'
 import CopilotLoginModal from './CopilotLoginModal.vue'
 import XaiOAuthLoginModal from './XaiOAuthLoginModal.vue'
 import AnthropicLoginModal from './AnthropicLoginModal.vue'
-import GeminiLoginModal from './GeminiLoginModal.vue'
 import { checkCopilotToken, enableCopilot, type CopilotTokenSource } from '@/api/hermes/copilot-auth'
-import { fetchProviderModels } from '@/api/hermes/system'
+import { fetchProviderModels, type ProviderApiMode } from '@/api/hermes/system'
 import { inferApiKeyFunPresetProvider, isApiKeyFunBaseUrl, type ApiKeyFunPresetProvider } from '@/utils/providerBaseUrl'
 
 const { t } = useI18n()
@@ -32,7 +31,6 @@ const showNousLogin = ref(false)
 const showCopilotLogin = ref(false)
 const showXaiLogin = ref(false)
 const showAnthropicLogin = ref(false)
-const showGeminiLogin = ref(false)
 const copilotChecking = ref(false)
 
 const providerType = ref<'preset' | 'custom'>('preset')
@@ -43,9 +41,17 @@ const formData = ref({
   api_key: '',
   model: '',
   context_length: null as number | null,
+  api_mode: 'chat_completions' as ProviderApiMode,
 })
 
 const modelOptions = ref<Array<{ label: string; value: string }>>([])
+const apiModeOptions: Array<{ label: string; value: ProviderApiMode }> = [
+  { label: 'chat_completions (/chat/completions)', value: 'chat_completions' },
+  { label: 'codex_responses (/responses)', value: 'codex_responses' },
+  { label: 'anthropic_messages (/messages)', value: 'anthropic_messages' },
+  { label: 'bedrock_converse (Converse API)', value: 'bedrock_converse' },
+  { label: 'codex_app_server (App Server)', value: 'codex_app_server' },
+]
 
 const CODEX_KEY = 'openai-codex'
 const NOUS_KEY = 'nous'
@@ -53,7 +59,6 @@ const COPILOT_KEY = 'copilot'
 const CLIPROXYAPI_KEY = 'cliproxyapi'
 const XAI_OAUTH_KEY = 'xai-oauth'
 const CLAUDE_OAUTH_KEY = 'claude-oauth'
-const GEMINI_OAUTH_KEY = 'google-gemini-cli'
 const ALIBABA_CODING_KEY = 'alibaba-coding-plan'
 const CUSTOM_STORED_PRESET_KEYS = new Set(['fun-codex', 'fun-claude'])
 const ALIBABA_CODING_REGIONS = {
@@ -67,7 +72,6 @@ const isCopilot = computed(() => selectedPreset.value === COPILOT_KEY)
 const isCliproxyApi = computed(() => selectedPreset.value === CLIPROXYAPI_KEY)
 const isXaiOAuth = computed(() => selectedPreset.value === XAI_OAUTH_KEY)
 const isClaudeOAuth = computed(() => selectedPreset.value === CLAUDE_OAUTH_KEY)
-const isGeminiOAuth = computed(() => selectedPreset.value === GEMINI_OAUTH_KEY)
 const isAlibabaCoding = computed(() => selectedPreset.value === ALIBABA_CODING_KEY)
 const alibabaCodingRegion = ref<'intl' | 'cn'>('intl')
 
@@ -86,8 +90,7 @@ const canFetchProviderCatalog = computed(() =>
     !isNous.value &&
     !isCopilot.value &&
     !isXaiOAuth.value &&
-    !isClaudeOAuth.value &&
-    !isGeminiOAuth.value
+    !isClaudeOAuth.value
   )),
 )
 
@@ -144,6 +147,7 @@ watch(selectedPreset, (val) => {
     if (group) {
       formData.value.name = group.label
       formData.value.base_url = group.base_url
+      formData.value.api_mode = group.api_mode || 'chat_completions'
       modelOptions.value = group.models.map((m: string) => ({ label: m, value: m }))
       if (group.models.length > 0) {
         formData.value.model = group.models[0]
@@ -156,8 +160,6 @@ watch(selectedPreset, (val) => {
       showXaiLogin.value = true
     } else if (val === CLAUDE_OAUTH_KEY) {
       showAnthropicLogin.value = true
-    } else if (val === GEMINI_OAUTH_KEY) {
-      showGeminiLogin.value = true
     }
   }
 })
@@ -180,7 +182,7 @@ watch(() => formData.value.model, (model) => {
 
 watch(providerType, () => {
   modelOptions.value = []
-  formData.value = { name: '', base_url: '', api_key: '', model: '', context_length: null }
+  formData.value = { name: '', base_url: '', api_key: '', model: '', context_length: null, api_mode: 'chat_completions' }
   selectedPreset.value = null
 })
 
@@ -262,16 +264,11 @@ async function handleSave() {
     return
   }
 
-  if (isGeminiOAuth.value) {
-    showGeminiLogin.value = true
-    return
-  }
-
   if (!formData.value.base_url.trim()) {
     message.warning(t('models.baseUrlRequired'))
     return
   }
-  if (!formData.value.api_key.trim() && !isCliproxyApi.value && !isXaiOAuth.value && !isClaudeOAuth.value && !isGeminiOAuth.value) {
+  if (!formData.value.api_key.trim() && !isCliproxyApi.value && !isXaiOAuth.value && !isClaudeOAuth.value) {
     message.warning(t('models.apiKeyRequired'))
     return
   }
@@ -301,6 +298,7 @@ async function handleSave() {
       api_key: formData.value.api_key.trim(),
       model: formData.value.model,
       context_length: contextLength,
+      api_mode: formData.value.api_mode,
       providerKey,
     })
     message.success(t('models.providerAdded'))
@@ -338,12 +336,6 @@ async function handleXaiSuccess() {
 
 async function handleAnthropicSuccess() {
   showAnthropicLogin.value = false
-  message.success(t('models.providerAdded'))
-  emit('saved')
-}
-
-async function handleGeminiSuccess() {
-  showGeminiLogin.value = false
   message.success(t('models.providerAdded'))
   emit('saved')
 }
@@ -414,11 +406,6 @@ function handleAnthropicClose() {
   selectedPreset.value = null
 }
 
-function handleGeminiClose() {
-  showGeminiLogin.value = false
-  selectedPreset.value = null
-}
-
 function handleClose() {
   showModal.value = false
   setTimeout(() => emit('close'), 200)
@@ -431,7 +418,7 @@ function handleClose() {
     preset="card"
     :title="t('models.addProvider')"
     :style="{ width: 'min(520px, calc(100vw - 32px))' }"
-    :mask-closable="!loading && !showCodexLogin && !showNousLogin && !showCopilotLogin && !showXaiLogin && !showAnthropicLogin && !showGeminiLogin"
+    :mask-closable="!loading && !showCodexLogin && !showNousLogin && !showCopilotLogin && !showXaiLogin && !showAnthropicLogin"
     @after-leave="emit('close')"
   >
     <NForm label-placement="top">
@@ -491,7 +478,7 @@ function handleClose() {
         />
       </NFormItem>
 
-      <NFormItem v-if="!isCodex && !isNous && !isClaudeOAuth && !isGeminiOAuth" :label="t('models.apiKey')" :required="!isCliproxyApi && !isXaiOAuth">
+      <NFormItem v-if="!isCodex && !isNous && !isClaudeOAuth" :label="t('models.apiKey')" :required="!isCliproxyApi && !isXaiOAuth">
         <NInput
           v-model:value="formData.api_key"
           type="password"
@@ -528,6 +515,13 @@ function handleClose() {
           :min="0"
           clearable
           style="width: 100%"
+        />
+      </NFormItem>
+
+      <NFormItem v-if="providerType === 'custom'" :label="t('models.apiMode')">
+        <NSelect
+          v-model:value="formData.api_mode"
+          :options="apiModeOptions"
         />
       </NFormItem>
     </NForm>
@@ -571,11 +565,6 @@ function handleClose() {
       @success="handleAnthropicSuccess"
     />
 
-    <GeminiLoginModal
-      v-if="showGeminiLogin"
-      @close="handleGeminiClose"
-      @success="handleGeminiSuccess"
-    />
   </NModal>
 </template>
 

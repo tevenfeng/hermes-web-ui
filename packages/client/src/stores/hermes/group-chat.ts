@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { getActiveProfileName, getApiKey, getStoredUsername } from '@/api/client'
 import { fetchCurrentUser } from '@/api/auth'
 import { getDownloadUrl } from '@/api/hermes/download'
+import { responseErrorMessage } from '@/utils/http-error'
 import type { Attachment, ContentBlock } from './chat'
 import {
     connectGroupChat,
@@ -24,7 +25,10 @@ import {
     cloneRoom as cloneRoomApi,
     deleteRoom as deleteRoomApi,
     clearRoomContext,
+    updateRoomWorkspace as updateRoomWorkspaceApi,
 } from '@/api/hermes/group-chat'
+
+type GroupChatSocket = ReturnType<typeof connectGroupChat>
 
 async function uploadGroupFiles(attachments: Attachment[]): Promise<{ name: string; path: string }[]> {
     const formData = new FormData()
@@ -41,7 +45,7 @@ async function uploadGroupFiles(attachments: Attachment[]): Promise<{ name: stri
         body: formData,
         headers,
     })
-    if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
+    if (!res.ok) throw new Error(await responseErrorMessage(res, 'Upload failed'))
     const data = await res.json() as { files: { name: string; path: string }[] }
     return data.files
 }
@@ -110,6 +114,7 @@ function mergeFinalMessage(existing: ChatMessage | null, msg: ChatMessage): Chat
         reasoning: hasText(msg.reasoning) ? msg.reasoning : existing?.reasoning ?? msg.reasoning ?? null,
         reasoning_content: hasText(msg.reasoning_content) ? msg.reasoning_content : existing?.reasoning_content ?? msg.reasoning_content ?? null,
         isStreaming: false,
+        firstSeenAt: existing?.firstSeenAt ?? msg.firstSeenAt,
         attachments: existing?.attachments || msg.attachments,
     }
 }
@@ -215,6 +220,13 @@ const currentUserAvatar = ref('')
     const userId = ref(getStoredUserId())
     const userName = ref(getStoredGroupUserName() || getStoredUsername() || '')
 
+    function upsertRoom(room: RoomInfo | undefined | null) {
+        if (!room) return
+        const idx = rooms.value.findIndex(existing => existing.id === room.id)
+        if (idx >= 0) rooms.value[idx] = room
+        else rooms.value.push(room)
+    }
+
     function applyRealtimeJoinState(res: any, options: { syncMessages?: boolean } = {}) {
         members.value = res.members || []
         if (res.agents) agents.value = res.agents
@@ -258,14 +270,50 @@ const currentUserAvatar = ref('')
         }
     }
 
-    async function joinRealtimeRoom(roomId: string, options: { syncMessages?: boolean } = {}) {
-        const socket = getSocket()
-        if (!socket) return
+    async function waitForRealtimeSocket(socket: GroupChatSocket): Promise<void> {
+        if (socket.connected) return
+        await new Promise<void>((resolve, reject) => {
+            let settled = false
+            let timeout: ReturnType<typeof setTimeout> | null = null
+            const cleanup = () => {
+                if (timeout) clearTimeout(timeout)
+                socket.off?.('connect', onConnect)
+                socket.off?.('connect_error', onError)
+            }
+            const finish = (fn: () => void) => {
+                if (settled) return
+                settled = true
+                cleanup()
+                fn()
+            }
+            const onConnect = () => finish(resolve)
+            const onError = (err: Error) => finish(() => reject(err))
+            timeout = setTimeout(() => finish(() => reject(new Error('Group chat socket connection timed out'))), 30000)
+            socket.once('connect', onConnect)
+            socket.once('connect_error', onError)
+        })
+    }
+
+    async function ensureRealtimeSocket(): Promise<GroupChatSocket> {
+        let socket = getSocket()
+        if (socket) return socket
+        await connect()
+        socket = getSocket({ requireConnected: false })
+        if (!socket) throw new Error('Group chat socket not connected')
+        await waitForRealtimeSocket(socket)
+        const connectedSocket = getSocket()
+        if (!connectedSocket) throw new Error('Group chat socket not connected')
+        return connectedSocket
+    }
+
+    async function joinRealtimeRoom(roomId: string, options: { syncMessages?: boolean; inviteCode?: string } = {}) {
+        const socket = await ensureRealtimeSocket()
         const storedName = getStoredGroupUserName()
 
         await new Promise<void>((resolve) => {
             socket.emit('join', {
                 roomId,
+                inviteCode: options.inviteCode,
                 name: storedName || undefined,
                 description: localStorage.getItem('gc_user_description') || undefined,
             }, (res: any) => {
@@ -284,7 +332,7 @@ const currentUserAvatar = ref('')
     }
 
     // ─── Computed ───────────────────────────────────────────
-    const sortedMessages = computed(() => mapGroupMessages([...messages.value].sort((a, b) => a.timestamp - b.timestamp)))
+    const sortedMessages = computed(() => mapGroupMessages([...messages.value].sort((a, b) => (a.firstSeenAt ?? a.timestamp) - (b.firstSeenAt ?? b.timestamp))))
 
     const memberNames = computed(() => {
         return members.value.map(m => m.name)
@@ -374,6 +422,7 @@ const currentUserAvatar = ref('')
                 !m.tool_calls?.length
             ))
             msg.isStreaming = true
+            msg.firstSeenAt = msg.firstSeenAt ?? msg.timestamp ?? Date.now()
             const idx = messages.value.findIndex(m => m.id === msg.id)
             if (idx >= 0) {
                 const existing = messages.value[idx]
@@ -568,6 +617,7 @@ const currentUserAvatar = ref('')
 
         try {
             const res = await getRoomDetail(roomId)
+            upsertRoom(res.room)
             currentRoomId.value = res.room.id
             roomName.value = res.room.name
             messages.value = res.messages
@@ -657,15 +707,16 @@ const currentUserAvatar = ref('')
         }
     }
 
-    async function createNewRoom(name: string, inviteCode: string, agentList?: { profile: string; name?: string; description?: string; invited?: boolean }[], compression?: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }) {
+    async function createNewRoom(name: string, inviteCode: string, agentList?: { profile: string; name?: string; description?: string; invited?: boolean }[], compression?: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }, workspace?: string) {
         try {
             const res = await createRoom({
                 name,
                 inviteCode,
                 agents: agentList,
                 compression: compression || { triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10 },
+                workspace: workspace || undefined,
             })
-            rooms.value.push(res.room)
+            upsertRoom(res.room)
             return res
         } catch (err: any) {
             error.value = err.message
@@ -676,6 +727,11 @@ const currentUserAvatar = ref('')
     async function joinByCode(code: string) {
         try {
             const res = await joinRoomByCode(code)
+            upsertRoom(res.room)
+            await ensureRealtimeSocket()
+            currentRoomId.value = res.room.id
+            roomName.value = res.room.name
+            await joinRealtimeRoom(res.room.id, { syncMessages: true, inviteCode: code })
             await joinRoom(res.room.id)
             return res.room
         } catch (err: any) {
@@ -705,7 +761,7 @@ const currentUserAvatar = ref('')
     async function cloneRoom(roomId: string, data?: { name?: string; inviteCode?: string }) {
         try {
             const res = await cloneRoomApi(roomId, data)
-            rooms.value.push(res.room)
+            upsertRoom(res.room)
             return res
         } catch (err: any) {
             error.value = err.message
@@ -724,6 +780,20 @@ const currentUserAvatar = ref('')
             const idx = rooms.value.findIndex(r => r.id === currentRoomId.value)
             if (idx >= 0 && res.room) rooms.value[idx] = res.room
             return res
+        } catch (err: any) {
+            error.value = err.message
+            throw err
+        }
+    }
+
+    async function setRoomWorkspace(roomId: string, workspace: string) {
+        try {
+            const res = await updateRoomWorkspaceApi(roomId, workspace)
+            if (res.room) {
+                upsertRoom(res.room)
+                if (currentRoomId.value === roomId) roomName.value = res.room.name
+            }
+            return res.room
         } catch (err: any) {
             error.value = err.message
             throw err
@@ -854,6 +924,7 @@ const currentUserAvatar = ref('')
         deleteRoom,
         cloneRoom,
         clearCurrentRoomContext,
+        setRoomWorkspace,
         loadAgents,
         addAgentToRoom,
         removeAgentFromRoom,
@@ -878,6 +949,17 @@ function runtimePayloadText(value: unknown): string {
         // Fall through to String(value) for non-serializable runtime payloads.
     }
     return String(value)
+}
+
+function parseWorkspaceDiffPayload(value: unknown): unknown {
+    const text = runtimePayloadText(value)
+    if (!text) return undefined
+    try {
+        const parsed = JSON.parse(text)
+        return parsed?.kind === 'workspace_diff' ? parsed : value
+    } catch {
+        return value
+    }
 }
 
 function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
@@ -926,6 +1008,9 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
             const toolName = msg.tool_name || toolNameMap.get(tcId) || undefined
             const toolArgs = toolArgsMap.has(tcId) ? toolArgsMap.get(tcId) : undefined
             let preview = ''
+            const toolResult = toolName === 'workspace_diff'
+                ? parseWorkspaceDiffPayload((msg as any).content)
+                : runtimeToolPayloadOrUndefined((msg as any).content)
             const contentText = runtimePayloadText((msg as any).content)
             if (contentText) {
                 try {
@@ -952,7 +1037,7 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
                 toolCallId: tcId || undefined,
                 toolArgs: toolArgs !== undefined ? toolArgs : (placeholderIdx !== -1 ? result[placeholderIdx].toolArgs : undefined),
                 toolPreview: typeof preview === 'string' ? preview.slice(0, 100) || undefined : undefined,
-                toolResult: runtimeToolPayloadOrUndefined((msg as any).content),
+                toolResult,
                 toolStatus: 'done',
             }
             if (placeholderIdx !== -1) result[placeholderIdx] = merged

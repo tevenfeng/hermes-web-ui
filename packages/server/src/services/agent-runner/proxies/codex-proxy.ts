@@ -88,10 +88,11 @@ async function callOpenAiChat(target: CodexProxyTarget, body: any): Promise<any>
     ;(err as any).status = 501
     throw err
   }
+  const chatBody = responsesToOpenAiChat(body, target)
   return agentRunGateway.completeJson({
     url: chatCompletionsUrl(target),
     apiKey: target.apiKey,
-    body: responsesToOpenAiChat(body, target),
+    body: chatBody,
   })
 }
 
@@ -101,6 +102,7 @@ async function callAnthropicMessages(target: CodexProxyTarget, body: any): Promi
     ;(err as any).status = 501
     throw err
   }
+  const anthropicBody = responsesToAnthropicMessages(body, target)
   return agentRunGateway.completeJson({
     url: anthropicMessagesUrl(target),
     apiKey: target.apiKey,
@@ -108,7 +110,7 @@ async function callAnthropicMessages(target: CodexProxyTarget, body: any): Promi
       'x-api-key': target.apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: responsesToAnthropicMessages(body, target),
+    body: anthropicBody,
   })
 }
 
@@ -118,10 +120,11 @@ async function callOpenAiResponses(target: CodexProxyTarget, body: any): Promise
     ;(err as any).status = 501
     throw err
   }
+  const responsesBody = { ...body, model: target.model }
   return agentRunGateway.completeJson({
     url: resolveResponsesUrl(target.baseUrl),
     apiKey: target.apiKey,
-    body: { ...body, model: target.model },
+    body: responsesBody,
   })
 }
 
@@ -134,11 +137,27 @@ function responsesEventStream(events: AsyncIterable<CanonicalResponsesEvent>): R
   return Readable.from(generate())
 }
 
+function responseEventForCodexClient(target: CodexProxyTarget, event: CanonicalResponsesEvent): CanonicalResponsesEvent {
+  if (target.apiMode === 'codex_responses' || event.type !== 'response.completed') return event
+  const response = (event.data as any).response
+  if (!response?.usage) return event
+  const { usage: _usage, ...responseWithoutUsage } = response
+  return {
+    ...event,
+    data: {
+      ...event.data,
+      response: responseWithoutUsage,
+    },
+  }
+}
+
 function observableResponsesEvents(target: CodexProxyTarget, events: AsyncIterable<CanonicalResponsesEvent>): AsyncIterable<CanonicalResponsesEvent> {
   async function* observe() {
     for await (const event of events) {
-      codingAgentRunManager.handleResponseEvent(target.agentSessionId, event)
-      yield event
+      codingAgentRunManager.handleProxyUsageEvent(target.agentSessionId, event)
+      const clientEvent = responseEventForCodexClient(target, event)
+      codingAgentRunManager.handleResponseEvent(target.agentSessionId, clientEvent)
+      yield clientEvent
     }
   }
   return observe()
@@ -151,12 +170,16 @@ async function openAiChatToResponsesSseStream(target: CodexProxyTarget, body: an
     throw err
   }
 
+  const chatBody = responsesToOpenAiChat(body, target, true)
   const stream = await agentRunGateway.streamBytes({
     url: chatCompletionsUrl(target),
     apiKey: target.apiKey,
-    body: responsesToOpenAiChat(body, target, true),
+    body: chatBody,
   })
-  return responsesEventStream(observableResponsesEvents(target, openAiChatSseToResponsesEvents(stream, target)))
+  return responsesEventStream(observableResponsesEvents(target, openAiChatSseToResponsesEvents(stream, {
+    ...target,
+    annotateMcpToolNamespaces: true,
+  })))
 }
 
 async function anthropicMessagesToResponsesSseStream(target: CodexProxyTarget, body: any): Promise<Readable> {
@@ -166,6 +189,7 @@ async function anthropicMessagesToResponsesSseStream(target: CodexProxyTarget, b
     throw err
   }
 
+  const anthropicBody = responsesToAnthropicMessages(body, target, true)
   const stream = await agentRunGateway.streamBytes({
     url: anthropicMessagesUrl(target),
     apiKey: target.apiKey,
@@ -173,9 +197,12 @@ async function anthropicMessagesToResponsesSseStream(target: CodexProxyTarget, b
       'x-api-key': target.apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: responsesToAnthropicMessages(body, target, true),
+    body: anthropicBody,
   })
-  return responsesEventStream(observableResponsesEvents(target, anthropicMessagesSseToResponsesEvents(stream, target)))
+  return responsesEventStream(observableResponsesEvents(target, anthropicMessagesSseToResponsesEvents(stream, {
+    ...target,
+    annotateMcpToolNamespaces: true,
+  })))
 }
 
 async function openAiResponsesSseStream(target: CodexProxyTarget, body: any): Promise<Readable> {
@@ -185,10 +212,11 @@ async function openAiResponsesSseStream(target: CodexProxyTarget, body: any): Pr
     throw err
   }
 
+  const responsesBody = { ...body, model: target.model, stream: true }
   const stream = await agentRunGateway.streamBytes({
     url: resolveResponsesUrl(target.baseUrl),
     apiKey: target.apiKey,
-    body: { ...body, model: target.model, stream: true },
+    body: responsesBody,
   })
   return responsesEventStream(observableResponsesEvents(target, openAiResponsesSseToResponsesEvents(stream)))
 }

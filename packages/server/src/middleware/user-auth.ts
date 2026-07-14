@@ -41,6 +41,34 @@ declare module 'koa' {
 
 const JWT_AUDIENCE = 'hermes-web-ui'
 const DEFAULT_EXPIRES_SECONDS = 60 * 60 * 24 * 30
+const MIN_EXPIRES_SECONDS = 1
+const MAX_EXPIRES_SECONDS = 60 * 60 * 24 * 365
+export const MODEL_RUN_EXPIRES_SECONDS = 60 * 60
+
+export function parseJwtExpirySeconds(value: string | undefined): number | null {
+  const raw = value?.trim()
+  if (!raw) return null
+
+  const match = raw.match(/^(\d+)(?:\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days))?$/i)
+  if (!match) return null
+
+  const amount = Number(match[1])
+  if (!Number.isSafeInteger(amount) || amount <= 0) return null
+
+  const unit = (match[2] || 's').toLowerCase()
+  const multiplier = unit.startsWith('d') ? 86400
+    : unit.startsWith('h') ? 3600
+      : unit.startsWith('m') ? 60
+        : 1
+  const seconds = amount * multiplier
+  if (!Number.isSafeInteger(seconds)) return null
+  if (seconds < MIN_EXPIRES_SECONDS || seconds > MAX_EXPIRES_SECONDS) return null
+  return seconds
+}
+
+export function getUserJwtExpiresSeconds(env: Record<string, string | undefined> = process.env): number {
+  return parseJwtExpirySeconds(env.HERMES_WEB_UI_AUTH_JWT_EXPIRES_IN) ?? DEFAULT_EXPIRES_SECONDS
+}
 
 function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url')
@@ -73,19 +101,10 @@ function requestToken(ctx: Context): string {
 const SERVER_TOKEN_EXACT_PATHS = new Set([
   '/api/hermes/media/apikey-image-generate',
   '/api/hermes/media/grok-image-to-video',
-  '/api/devices',
-  '/api/devices/scan',
-  '/api/devices/peer-connections',
 ])
 
 function allowsServerTokenPath(path: string): boolean {
-  if (SERVER_TOKEN_EXACT_PATHS.has(path)) return true
-  return /^\/api\/devices\/[^/]+\/connect$/.test(path) ||
-    /^\/api\/devices\/peer-connections\/[^/]+\/disconnect$/.test(path) ||
-    /^\/api\/devices\/peer-connections\/[^/]+\/terminal$/.test(path) ||
-    /^\/api\/devices\/peer-connections\/[^/]+\/terminals$/.test(path) ||
-    /^\/api\/devices\/peer-connections\/[^/]+\/terminal\/[^/]+\/(read|input|resize|close)$/.test(path) ||
-    /^\/api\/devices\/peer-connections\/[^/]+\/(exec|download|upload)$/.test(path)
+  return SERVER_TOKEN_EXACT_PATHS.has(path)
 }
 
 function isLoopbackRequest(ctx: Context): boolean {
@@ -116,7 +135,12 @@ function isProtectedHttpPath(path: string): boolean {
     lowerPath.startsWith('/upload')
 }
 
-export function signUserJwt(user: Pick<UserRecord, 'id' | 'username' | 'role'>, secret: string, now = Date.now()): string {
+export function signUserJwt(
+  user: Pick<UserRecord, 'id' | 'username' | 'role'>,
+  secret: string,
+  now = Date.now(),
+  expiresSeconds = DEFAULT_EXPIRES_SECONDS,
+): string {
   const iat = Math.floor(now / 1000)
   const payload: JwtPayload = {
     sub: String(user.id),
@@ -125,7 +149,7 @@ export function signUserJwt(user: Pick<UserRecord, 'id' | 'username' | 'role'>, 
     type: 'access',
     aud: JWT_AUDIENCE,
     iat,
-    exp: iat + DEFAULT_EXPIRES_SECONDS,
+    exp: iat + expiresSeconds,
   }
   const header = base64UrlJson({ alg: 'HS256', typ: 'JWT' })
   const body = base64UrlJson(payload)
@@ -154,7 +178,12 @@ export function verifyUserJwt(token: string, secret: string, now = Date.now()): 
 
 export async function issueUserJwt(user: Pick<UserRecord, 'id' | 'username' | 'role'>): Promise<string> {
   const secret = await getJwtSecret()
-  return signUserJwt(user, secret)
+  return signUserJwt(user, secret, Date.now(), getUserJwtExpiresSeconds())
+}
+
+export async function issueModelRunJwt(user: Pick<UserRecord, 'id' | 'username' | 'role'>): Promise<string> {
+  const secret = await getJwtSecret()
+  return signUserJwt(user, secret, Date.now(), MODEL_RUN_EXPIRES_SECONDS)
 }
 
 export function toAuthenticatedUser(user: Pick<UserRecord, 'id' | 'username' | 'role'>): AuthenticatedUser {

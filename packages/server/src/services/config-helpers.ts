@@ -3,6 +3,7 @@ import { readdir, stat } from 'fs/promises'
 import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { getActiveProfileDir, getActiveConfigPath, getActiveEnvPath, getProfileDir } from './hermes/hermes-profile'
+import { getCompatibleCustomProviders } from './hermes/custom-providers-compat'
 import { logger } from './logger'
 import { safeFileStore } from './safe-file-store'
 
@@ -12,8 +13,8 @@ export const PROVIDER_ENV_MAP: Record<string, { api_key_env: string; base_url_en
   'fun-claude': { api_key_env: '', base_url_env: '' },
   lmstudio: { api_key_env: 'LM_API_KEY', base_url_env: 'LM_BASE_URL' },
   openrouter: { api_key_env: 'OPENROUTER_API_KEY', base_url_env: 'OPENROUTER_BASE_URL' },
-  'glm-coding-plan': { api_key_env: '', base_url_env: '' },
-  zai: { api_key_env: 'GLM_API_KEY', base_url_env: 'GLM_BASE_URL' },
+  glm: { api_key_env: 'GLM_API_KEY', base_url_env: '' },
+  zai: { api_key_env: 'ZAI_API_KEY', base_url_env: 'ZAI_BASE_URL' },
   'kimi-coding': { api_key_env: 'KIMI_API_KEY', base_url_env: 'KIMI_BASE_URL' },
   'kimi-coding-cn': { api_key_env: 'KIMI_CN_API_KEY', base_url_env: '' },
   minimax: { api_key_env: 'MINIMAX_API_KEY', base_url_env: 'MINIMAX_BASE_URL' },
@@ -25,10 +26,10 @@ export const PROVIDER_ENV_MAP: Record<string, { api_key_env: string; base_url_en
   'claude-oauth': { api_key_env: '', base_url_env: '' },
   xai: { api_key_env: 'XAI_API_KEY', base_url_env: 'XAI_BASE_URL' },
   'xai-oauth': { api_key_env: '', base_url_env: '' },
+  'qwen-oauth': { api_key_env: '', base_url_env: 'HERMES_QWEN_BASE_URL' },
   xiaomi: { api_key_env: 'XIAOMI_API_KEY', base_url_env: 'XIAOMI_BASE_URL' },
   'xiaomi-token-plan': { api_key_env: 'XIAOMI_TOKEN_PLAN_API_KEY', base_url_env: 'XIAOMI_TOKEN_PLAN_BASE_URL' },
   gemini: { api_key_env: 'GEMINI_API_KEY', base_url_env: 'GEMINI_BASE_URL' },
-  'google-gemini-cli': { api_key_env: '', base_url_env: '' },
   kilocode: { api_key_env: 'KILO_API_KEY', base_url_env: 'KILOCODE_BASE_URL' },
   'ai-gateway': { api_key_env: 'AI_GATEWAY_API_KEY', base_url_env: 'AI_GATEWAY_BASE_URL' },
   cliproxyapi: { api_key_env: '', base_url_env: '' },
@@ -45,7 +46,7 @@ export const PROVIDER_ENV_MAP: Record<string, { api_key_env: string; base_url_en
   'openai-codex': { api_key_env: '', base_url_env: '' },
   'openai-api': { api_key_env: 'OPENAI_API_KEY', base_url_env: 'OPENAI_BASE_URL' },
   copilot: { api_key_env: 'GITHUB_TOKEN', base_url_env: '' },
-  longcat: { api_key_env: 'LONGCAT_API_KEY', base_url_env: 'LONGCAT_BASE_URL' },
+  longcat: { api_key_env: '', base_url_env: '' },
   'tencent-tokenhub': { api_key_env: 'TENCENT_TOKENHUB_API_KEY', base_url_env: 'TOKENHUB_BASE_URL' },
 }
 
@@ -262,22 +263,26 @@ export function buildModelGroups(config: Record<string, any>): { default: string
     defaultModel = modelSection.trim()
   }
 
-  // 2. Extract custom_providers section
-  const customProviders = config.custom_providers
-  if (Array.isArray(customProviders)) {
-    const customModels: ModelInfo[] = []
-    for (const entry of customProviders) {
-      if (entry && typeof entry === 'object') {
-        const cName = String(entry.name || '').trim()
-        const cModel = String(entry.model || '').trim()
-        if (cName && cModel) {
-          customModels.push({ id: cModel, label: `${cName}: ${cModel}` })
-        }
-      }
+  // 2. Aggregate custom providers from both schemas (legacy list + v12+ dict).
+  const customProviders = getCompatibleCustomProviders(config)
+  const customModels: ModelInfo[] = []
+  for (const entry of customProviders) {
+    const cName = entry.name.trim()
+    if (!cName) continue
+    const seen = new Set<string>()
+    const pushModel = (modelId: string) => {
+      const id = modelId.trim()
+      if (!id || seen.has(id)) return
+      seen.add(id)
+      customModels.push({ id, label: `${cName}: ${id}` })
     }
-    if (customModels.length > 0) {
-      groups.push({ provider: 'Custom', models: customModels })
+    if (entry.model) pushModel(entry.model)
+    if (entry.models && typeof entry.models === 'object') {
+      for (const id of Object.keys(entry.models)) pushModel(id)
     }
+  }
+  if (customModels.length > 0) {
+    groups.push({ provider: 'Custom', models: customModels })
   }
 
   return { default: defaultModel, groups }

@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rm, stat, writeFile, cp } from 'fs/promises'
+import { mkdir, readdir, readFile, realpath, rm, stat, writeFile, cp } from 'fs/promises'
 import { homedir, tmpdir } from 'os'
 import { dirname, join, resolve } from 'path'
 import { createHash, randomBytes } from 'crypto'
@@ -22,6 +22,46 @@ function requestProfileDir(ctx: any): string {
 
 function requestSkillsDir(ctx: any): string {
   return join(requestProfileDir(ctx), 'skills')
+}
+
+type SkillTarget = 'hermes' | 'claude' | 'codex'
+
+function requestSkillTarget(ctx: any): SkillTarget {
+  const target = String(ctx.query?.target || 'hermes').trim().toLowerCase()
+  return target === 'claude' || target === 'codex' ? target : 'hermes'
+}
+
+function globalSkillsDir(target: Exclude<SkillTarget, 'hermes'>): string {
+  return target === 'claude'
+    ? join(homedir(), '.claude', 'skills')
+    : join(homedir(), '.agents', 'skills')
+}
+
+function codexSystemSkillsDir(): string {
+  return join(homedir(), '.codex', 'skills', '.system')
+}
+
+function requestTargetSkillsDir(ctx: any): string {
+  const target = requestSkillTarget(ctx)
+  return target === 'hermes' ? requestSkillsDir(ctx) : globalSkillsDir(target)
+}
+
+async function resolveSkillDirForTarget(ctx: any, category: string, skillName: string): Promise<string | null> {
+  const target = requestSkillTarget(ctx)
+  const skillsDir = requestTargetSkillsDir(ctx)
+  if (target === 'hermes') {
+    const config = await readConfigYamlForProfile(requestedProfile(ctx))
+    return resolveSkillDirFromConfig(config, skillsDir, category, skillName)
+  }
+
+  const localSkillDir = await findSkillDirInRoot(skillsDir, category, skillName)
+  if (localSkillDir) return localSkillDir
+
+  if (target === 'codex') {
+    return findSkillDirInRoot(codexSystemSkillsDir(), category, skillName)
+  }
+
+  return null
 }
 
 function expandConfiguredPath(value: string): string {
@@ -178,18 +218,20 @@ function readUsageStats(usageContent: string | null): Map<string, UsageStats> {
   return map
 }
 
-async function findSkillDirByName(rootDir: string, skillName: string): Promise<string | null> {
-  let entries: import('fs').Dirent[]
+async function findSkillDirByName(rootDir: string, skillName: string, visited = new Set<string>()): Promise<string | null> {
+  const currentRealPath = await realpath(rootDir).catch(() => resolve(rootDir))
+  if (visited.has(currentRealPath)) return null
+  visited.add(currentRealPath)
+
+  let entries: VisibleDirectoryEntry[]
   try {
-    entries = await readdir(rootDir, { withFileTypes: true })
+    entries = await listVisibleDirectoryEntries(rootDir)
   } catch {
     return null
   }
 
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
-
-    const entryPath = join(rootDir, entry.name)
+    const entryPath = entry.path
     const skillMd = await safeReadFile(join(entryPath, 'SKILL.md'))
     if (skillMd !== null) {
       if (entry.name === skillName) return entryPath
@@ -197,7 +239,7 @@ async function findSkillDirByName(rootDir: string, skillName: string): Promise<s
       continue
     }
 
-    const found = await findSkillDirByName(entryPath, skillName)
+    const found = await findSkillDirByName(entryPath, skillName, visited)
     if (found) return found
   }
 
@@ -229,6 +271,35 @@ async function resolveSkillDirFromConfig(
   return null
 }
 
+interface VisibleDirectoryEntry {
+  name: string
+  path: string
+}
+
+async function listVisibleDirectoryEntries(dir: string): Promise<VisibleDirectoryEntry[]> {
+  const entries = await readdir(dir, { withFileTypes: true })
+  const directories: VisibleDirectoryEntry[] = []
+
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
+
+    const entryPath = join(dir, entry.name)
+    try {
+      const info = await stat(entryPath)
+      if (!info.isDirectory()) continue
+      directories.push({
+        name: entry.name,
+        path: entryPath,
+      })
+    } catch {
+      continue
+    }
+  }
+
+  return directories
+}
+
 /**
  * Scan for skills at different directory depths.
  *
@@ -241,21 +312,18 @@ async function resolveSkillDirFromConfig(
  * Skills without a parent category (flat skills) are grouped under the "misc" category.
  */
 async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, string>, hubNames: Set<string>, disabledList: string[], usageStats: Map<string, UsageStats>) {
-  const allEntries = await readdir(skillsDir, { withFileTypes: true })
-  const dirNames = allEntries
-    .filter(e => e.isDirectory() && !e.name.startsWith('.'))
-    .map(e => e.name)
+  const rootRealPath = await realpath(skillsDir).catch(() => resolve(skillsDir))
+  const dirEntries = await listVisibleDirectoryEntries(skillsDir)
 
   // Classify directories: categories vs. flat skills
-  const categoryDirs: { name: string; description: string }[] = []
+  const categoryDirs: { name: string; description: string; path: string }[] = []
   const flatSkills: { name: string; skillMd: string; source: string }[] = []
 
-  for (const dirName of dirNames) {
-    const catDir = join(skillsDir, dirName)
+  for (const entry of dirEntries) {
+    const catDir = entry.path
     const hasDesc = await safeReadFile(join(catDir, 'DESCRIPTION.md'))
     const hasSkillMd = await safeReadFile(join(catDir, 'SKILL.md'))
-    const subEntries = await readdir(catDir, { withFileTypes: true })
-    const subDirs = subEntries.filter(se => se.isDirectory())
+    const subDirs = await listVisibleDirectoryEntries(catDir)
 
     // Priority: SKILL.md at top level → flat skill
     //           DESCRIPTION.md or subdirs (without SKILL.md) → category
@@ -263,14 +331,14 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
       // Flat skill: has SKILL.md at the top level (two-level pattern)
       // Could also have subdirectories (references/, scripts/, etc.)
       flatSkills.push({
-        name: dirName,
+        name: entry.name,
         skillMd: hasSkillMd,
-        source: getSkillSource(dirName, bundledManifest, hubNames),
+        source: getSkillSource(entry.name, bundledManifest, hubNames),
       })
     } else if (!!hasDesc || subDirs.length > 0) {
       // True category: has DESCRIPTION.md or subdirs, but no SKILL.md at top level
       const catDescription = hasDesc ? hasDesc.trim().split('\n')[0].replace(/^#+\s*/, '').slice(0, 100) : ''
-      categoryDirs.push({ name: dirName, description: catDescription })
+      categoryDirs.push({ name: entry.name, description: catDescription, path: catDir })
     }
   }
 
@@ -278,16 +346,18 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
   const categories: any[] = []
 
   for (const cat of categoryDirs) {
-    const catDir = join(skillsDir, cat.name)
-    const subEntries = await readdir(catDir, { withFileTypes: true })
+    const catDir = cat.path
     const skills: any[] = []
     // Recursively collect skills from subdirectories (supports nested sub-categories)
-    async function collectSkills(dir: string): Promise<any[]> {
-      const entries = await readdir(dir, { withFileTypes: true })
+    async function collectSkills(dir: string, visited = new Set<string>([rootRealPath])): Promise<any[]> {
+      const currentRealPath = await realpath(dir).catch(() => resolve(dir))
+      if (visited.has(currentRealPath)) return []
+      visited.add(currentRealPath)
+
+      const entries = await listVisibleDirectoryEntries(dir)
       const results: any[] = []
       for (const entry of entries) {
-        if (!entry.isDirectory() || entry.name.startsWith('.')) continue
-        const entryPath = join(dir, entry.name)
+        const entryPath = entry.path
         const skillMd = await safeReadFile(join(entryPath, 'SKILL.md'))
         if (skillMd) {
           const source = getSkillSource(entry.name, bundledManifest, hubNames)
@@ -313,7 +383,7 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
           })
         } else {
           // No SKILL.md — might be a sub-category container, recurse deeper
-          const subResults = await collectSkills(entryPath)
+          const subResults = await collectSkills(entryPath, visited)
           results.push(...subResults)
         }
       }
@@ -353,6 +423,26 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
   categories.sort((a, b) => a.name.localeCompare(b.name))
   for (const cat of categories) { cat.skills.sort((a: any, b: any) => a.name.localeCompare(b.name)) }
   return categories
+}
+
+async function scanSkillsDirIfExists(skillsDir: string, bundledManifest: Map<string, string>, hubNames: Set<string>, disabledList: string[], usageStats: Map<string, UsageStats>) {
+  try {
+    const info = await stat(skillsDir)
+    if (!info.isDirectory()) return []
+  } catch {
+    return []
+  }
+  return scanSkillsDir(skillsDir, bundledManifest, hubNames, disabledList, usageStats)
+}
+
+function withSkillSource(categories: any[], source: SkillSource): any[] {
+  return categories.map(category => ({
+    ...category,
+    skills: (category.skills || []).map((skill: any) => ({
+      ...skill,
+      source,
+    })),
+  }))
 }
 
 async function scanExternalSkillsDir(
@@ -415,8 +505,29 @@ function mergeExternalCategories(categories: any[], externalCategories: any[]): 
 }
 
 export async function list(ctx: any) {
-  const skillsDir = requestSkillsDir(ctx)
+  const target = requestSkillTarget(ctx)
+  const skillsDir = requestTargetSkillsDir(ctx)
   try {
+    if (target !== 'hermes') {
+      let categories = await scanSkillsDirIfExists(skillsDir, new Map(), new Set(), [], new Map())
+      const extraDirs: string[] = []
+      if (target === 'codex') {
+        const systemDir = codexSystemSkillsDir()
+        extraDirs.push(systemDir)
+        const systemCategories = withSkillSource(
+          await scanSkillsDirIfExists(systemDir, new Map(), new Set(), [], new Map()),
+          'builtin',
+        )
+        categories = mergeExternalCategories(categories, systemCategories)
+      }
+      ctx.body = {
+        categories,
+        archived: [],
+        paths: { local: skillsDir, external: extraDirs },
+      }
+      return
+    }
+
     const config = await readConfigYamlForProfile(requestedProfile(ctx))
     const disabledList: string[] = config.skills?.disabled || []
 
@@ -426,7 +537,7 @@ export async function list(ctx: any) {
     const usageStats = readUsageStats(await safeReadFile(join(skillsDir, '.usage.json')))
 
     // Scan all skills (supports both two-level and three-level directory structures)
-    let categories = await scanSkillsDir(skillsDir, bundledManifest, hubNames, disabledList, usageStats)
+    let categories = await scanSkillsDirIfExists(skillsDir, bundledManifest, hubNames, disabledList, usageStats)
     // Map resolved → raw so we can attach the user-written path (e.g. ~/...) to
     // each external skill — the SkillsView groups by this when the external
     // filter is active.
@@ -584,10 +695,8 @@ export async function toggle(ctx: any) {
 
 export async function listFiles(ctx: any) {
   const { category, skill } = ctx.params
-  const profileSkillsDir = requestSkillsDir(ctx)
   try {
-    const config = await readConfigYamlForProfile(requestedProfile(ctx))
-    const skillDir = await resolveSkillDirFromConfig(config, profileSkillsDir, category, skill)
+    const skillDir = await resolveSkillDirForTarget(ctx, category, skill)
     if (!skillDir) {
       ctx.status = 404
       ctx.body = { error: 'Skill not found' }
@@ -604,7 +713,7 @@ export async function listFiles(ctx: any) {
 
 export async function readFile_(ctx: any) {
   const filePath = (ctx.params as any).path
-  const profileSkillsDir = requestSkillsDir(ctx)
+  const profileSkillsDir = requestTargetSkillsDir(ctx)
   // Handle 'misc' category: real skill dir is skills/<skill>, not skills/misc/<skill>
   let realPath = filePath
   if (filePath.startsWith('misc/')) {
@@ -625,8 +734,7 @@ export async function readFile_(ctx: any) {
       const category = parts[0]
       const skillName = parts[1]
       const restPath = parts.slice(2).join('/')
-      const config = await readConfigYamlForProfile(requestedProfile(ctx))
-      const skillDir = await resolveSkillDirFromConfig(config, profileSkillsDir, category, skillName)
+      const skillDir = await resolveSkillDirForTarget(ctx, category, skillName)
       if (skillDir) {
         const resolvedPath = resolve(join(skillDir, restPath))
         if (isPathWithin(resolvedPath, skillDir)) {
@@ -680,6 +788,7 @@ export async function pin_(ctx: any) {
 }
 
 const MAX_SKILL_UPLOAD_SIZE = 50 * 1024 * 1024 // 50MB
+const MAX_SKILL_CONTENT_SIZE = 1024 * 1024 // 1MB
 
 function isValidSkillName(name: string): boolean {
   // Reject empty / path traversal / absolute paths
@@ -687,6 +796,62 @@ function isValidSkillName(name: string): boolean {
   if (name === '.' || name === '..') return false
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) return false
   return true
+}
+
+export async function updateSkill(ctx: any) {
+  const category = String((ctx.params as any)?.category || '')
+  const name = String((ctx.params as any)?.skill || '')
+  const content = (ctx.request.body as { content?: unknown } | undefined)?.content
+
+  if (!isValidSkillName(category) || !isValidSkillName(name)) {
+    ctx.status = 400
+    ctx.body = { error: 'Invalid category or skill name' }
+    return
+  }
+  if (typeof content !== 'string') {
+    ctx.status = 400
+    ctx.body = { error: 'content must be a string' }
+    return
+  }
+  if (Buffer.byteLength(content, 'utf-8') > MAX_SKILL_CONTENT_SIZE) {
+    ctx.status = 413
+    ctx.body = { error: `Skill content too large (max ${MAX_SKILL_CONTENT_SIZE / 1024 / 1024}MB)` }
+    return
+  }
+
+  const target = requestSkillTarget(ctx)
+  const skillsDir = requestTargetSkillsDir(ctx)
+  try {
+    if (target === 'hermes') {
+      const bundledManifest = readBundledManifest(await safeReadFile(join(skillsDir, '.bundled_manifest')))
+      const hubNames = readHubInstalledNames(await safeReadFile(join(skillsDir, '.hub', 'lock.json')))
+      const source = getSkillSource(name, bundledManifest, hubNames)
+      if (source !== 'local') {
+        ctx.status = 403
+        ctx.body = { error: `Only local skills can be edited (this skill is ${source})` }
+        return
+      }
+    }
+
+    const localSkillDir = await findSkillDirInRoot(skillsDir, category, name)
+    if (!localSkillDir) {
+      ctx.status = 404
+      ctx.body = { error: 'Skill not found' }
+      return
+    }
+    if (!isPathWithin(localSkillDir, skillsDir)) {
+      ctx.status = 403
+      ctx.body = { error: 'Access denied' }
+      return
+    }
+
+    await writeFile(join(localSkillDir, 'SKILL.md'), content, 'utf-8')
+    hashCache.delete(localSkillDir)
+    ctx.body = { success: true }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
 }
 
 function splitMultipart(raw: Buffer, boundary: Buffer): Buffer[] {
