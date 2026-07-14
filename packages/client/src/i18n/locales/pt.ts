@@ -184,7 +184,6 @@ export default {
     chat: 'Chat',
     backToChat: 'Voltar',
     search: 'Pesquisar',
-    apiRelay: 'API Relay',
     history: 'Historico',
     jobs: 'Tarefas agendadas',
     models: 'Modelos',
