@@ -470,13 +470,89 @@ describe('ekko-agent runtime', () => {
         { role: 'system', content: 'User system.' },
         { role: 'user', content: 'Go' },
       ],
+      model: 'test-model',
     })
 
     expect(requests[0].messages[0].content).toContain('Base prompt.')
     expect(requests[0].messages[0].content).toContain('Use tools carefully.')
     expect(requests[0].messages[0].content).toContain('Review for correctness.')
     expect(requests[0].messages[0].content).toContain('User system.')
+    expect(requests[0].messages[0].content).toContain('## Runtime Context\nprovider: test\nmodel: test-model')
     expect(requests[0].messages.filter(message => message.role === 'system')).toHaveLength(1)
+  })
+
+  it('disables all tools without disabling skill instructions', async () => {
+    const listTools = vi.fn(async () => [])
+    const tools = new AgentToolRegistry()
+    tools.registerProvider({ id: 'dynamic', listTools })
+    const client = modelClient((request) => {
+      expect(request.tools).toBeUndefined()
+      expect(request.messages[0].content).toContain('Keep this skill instruction.')
+      return { content: 'ok' }
+    })
+
+    await new AgentRuntime({
+      modelClient: client,
+      tools,
+      toolsEnabled: false,
+      skills: [{
+        id: 'kept-skill',
+        name: 'Kept Skill',
+        instructions: 'Keep this skill instruction.',
+      }],
+    }).run({ messages: ['hi'] })
+
+    expect(listTools).not.toHaveBeenCalled()
+  })
+
+  it('disables constructor and per-run skills without disabling regular tools', async () => {
+    const regularTool: AgentTool = {
+      definition: { name: 'regular_tool', parameters: { type: 'object' } },
+      async execute() {
+        return { ok: true, content: 'regular' }
+      },
+    }
+    const skillTool: AgentTool = {
+      definition: { name: 'skill_tool', parameters: { type: 'object' } },
+      async execute() {
+        return { ok: true, content: 'skill' }
+      },
+    }
+    const tools = new AgentToolRegistry()
+    tools.register(regularTool)
+    const client = modelClient((request) => {
+      expect(request.tools?.map(tool => tool.name)).toEqual(['regular_tool'])
+      expect(request.messages[0].content).not.toContain('Disabled constructor skill.')
+      expect(request.messages[0].content).not.toContain('Disabled run skill.')
+      return { content: 'ok' }
+    })
+    const runtime = new AgentRuntime({
+      modelClient: client,
+      tools,
+      skillsEnabled: false,
+      skills: [{
+        id: 'constructor-skill',
+        name: 'Constructor Skill',
+        instructions: 'Disabled constructor skill.',
+        tools: [skillTool],
+      }],
+    })
+
+    runtime.registerSkill({
+      id: 'registered-skill',
+      name: 'Registered Skill',
+      instructions: 'Disabled registered skill.',
+      tools: [skillTool],
+    })
+    await runtime.run({
+      messages: ['hi'],
+      skills: [{
+        id: 'run-skill',
+        name: 'Run Skill',
+        instructions: 'Disabled run skill.',
+        tools: [skillTool],
+      }],
+    })
   })
 
   it('refreshes dynamic tool providers before running', async () => {
@@ -541,5 +617,23 @@ describe('ekko-agent runtime', () => {
     expect(prompt).toContain('Base')
     expect(prompt).not.toContain('Available Tools')
     expect(prompt).not.toContain('read_file')
+  })
+
+  it('buildSystemPrompt includes provider and model in runtime context', () => {
+    const prompt = buildSystemPrompt({
+      basePrompt: 'Base',
+      context: {
+        provider: 'openrouter',
+        model: 'anthropic/claude-sonnet-4',
+        workspaceRoot: '/tmp/workspace',
+      },
+    })
+
+    expect(prompt).toContain([
+      '## Runtime Context',
+      'provider: openrouter',
+      'model: anthropic/claude-sonnet-4',
+      'workspaceRoot: /tmp/workspace',
+    ].join('\n'))
   })
 })

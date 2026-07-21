@@ -16,6 +16,7 @@ type TranslationKey =
   | 'update.currentVersion'
   | 'update.availableTitle'
   | 'update.availableMessage'
+  | 'update.availableDetail'
   | 'update.downloading'
   | 'update.readyTitle'
   | 'update.readyMessage'
@@ -42,6 +43,7 @@ type TranslationKey =
   | 'runtime.downloadingPackage'
   | 'runtime.verifying'
   | 'runtime.extracting'
+  | 'runtime.migrating'
   | 'runtime.ready'
   | 'common.ok'
   | 'common.cancel'
@@ -71,6 +73,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': 'Current version: {version}',
     'update.availableTitle': 'Update available',
     'update.availableMessage': 'Hermes Studio {version} is available.',
+    'update.availableDetail': 'Choose whether to download this update.',
     'update.downloading': 'The update is downloading in the background.',
     'update.readyTitle': 'Update ready',
     'update.readyMessage': 'Hermes Studio {version} is ready to install.',
@@ -97,6 +100,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': 'Downloading {name}...',
     'runtime.verifying': 'Verifying Hermes runtime...',
     'runtime.extracting': 'Extracting Hermes runtime...',
+    'runtime.migrating': 'Copying Runtime and downloaded Web UI versions to the selected storage directory...',
     'runtime.ready': 'Hermes runtime ready.',
     'common.ok': 'OK',
     'common.cancel': 'Cancel',
@@ -123,6 +127,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': '当前版本：{version}',
     'update.availableTitle': '发现新版本',
     'update.availableMessage': 'Hermes Studio {version} 可用。',
+    'update.availableDetail': '请选择是否下载此更新。',
     'update.downloading': '更新正在后台下载。',
     'update.readyTitle': '更新已就绪',
     'update.readyMessage': 'Hermes Studio {version} 已准备好安装。',
@@ -149,6 +154,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': '正在下载 {name}...',
     'runtime.verifying': '正在校验 Hermes 运行时...',
     'runtime.extracting': '正在解压 Hermes 运行时...',
+    'runtime.migrating': '正在将 Runtime 和已下载的 Web UI 版本迁移到所选存储目录...',
     'runtime.ready': 'Hermes 运行时已就绪。',
     'common.ok': '确定',
     'common.cancel': '取消',
@@ -175,6 +181,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': '目前版本：{version}',
     'update.availableTitle': '發現新版本',
     'update.availableMessage': 'Hermes Studio {version} 可用。',
+    'update.availableDetail': '請選擇是否下載此更新。',
     'update.downloading': '更新正在背景下載。',
     'update.readyTitle': '更新已就緒',
     'update.readyMessage': 'Hermes Studio {version} 已準備好安裝。',
@@ -201,6 +208,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': '正在下載 {name}...',
     'runtime.verifying': '正在校驗 Hermes 運行時...',
     'runtime.extracting': '正在解壓 Hermes 運行時...',
+    'runtime.migrating': '正在將 Runtime 和已下載的 Web UI 版本遷移至所選儲存目錄...',
     'runtime.ready': 'Hermes 運行時已就緒。',
     'common.ok': '確定',
     'common.cancel': '取消',
@@ -227,6 +235,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': '現在のバージョン: {version}',
     'update.availableTitle': 'アップデートがあります',
     'update.availableMessage': 'Hermes Studio {version} が利用できます。',
+    'update.availableDetail': 'このアップデートをダウンロードするか選択してください。',
     'update.downloading': 'アップデートをバックグラウンドでダウンロードしています。',
     'update.readyTitle': 'アップデートの準備ができました',
     'update.readyMessage': 'Hermes Studio {version} をインストールできます。',
@@ -253,6 +262,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': '{name} をダウンロードしています...',
     'runtime.verifying': 'Hermes ランタイムを検証しています...',
     'runtime.extracting': 'Hermes ランタイムを展開しています...',
+    'runtime.migrating': 'Runtime とダウンロード済み Web UI を選択した保存先へ移行しています...',
     'runtime.ready': 'Hermes ランタイムの準備ができました。',
     'common.ok': 'OK',
     'common.cancel': 'Cancel',
@@ -279,6 +289,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': '현재 버전: {version}',
     'update.availableTitle': '업데이트 사용 가능',
     'update.availableMessage': 'Hermes Studio {version}을 사용할 수 있습니다.',
+    'update.availableDetail': '이 업데이트를 다운로드할지 선택하세요.',
     'update.downloading': '업데이트를 백그라운드에서 다운로드하고 있습니다.',
     'update.readyTitle': '업데이트 준비 완료',
     'update.readyMessage': 'Hermes Studio {version}을 설치할 준비가 되었습니다.',
@@ -305,6 +316,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': '{name} 다운로드 중...',
     'runtime.verifying': 'Hermes 런타임을 검증하는 중...',
     'runtime.extracting': 'Hermes 런타임을 압축 해제하는 중...',
+    'runtime.migrating': 'Runtime과 다운로드된 Web UI를 선택한 저장 디렉터리로 이동하는 중...',
     'runtime.ready': 'Hermes 런타임이 준비되었습니다.',
     'common.ok': '확인',
     'common.cancel': 'Cancel',
@@ -331,6 +343,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': 'Version actuelle : {version}',
     'update.availableTitle': 'Mise a jour disponible',
     'update.availableMessage': 'Hermes Studio {version} est disponible.',
+    'update.availableDetail': 'Choisissez si vous souhaitez telecharger cette mise a jour.',
     'update.downloading': 'La mise a jour se telecharge en arriere-plan.',
     'update.readyTitle': 'Mise a jour prete',
     'update.readyMessage': 'Hermes Studio {version} est pret a etre installe.',
@@ -357,6 +370,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': 'Telechargement de {name}...',
     'runtime.verifying': 'Verification du runtime Hermes...',
     'runtime.extracting': 'Extraction du runtime Hermes...',
+    'runtime.migrating': 'Migration du Runtime et des versions Web UI vers le repertoire selectionne...',
     'runtime.ready': 'Runtime Hermes pret.',
     'common.ok': 'OK',
     'common.cancel': 'Cancel',
@@ -383,6 +397,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': 'Version actual: {version}',
     'update.availableTitle': 'Actualizacion disponible',
     'update.availableMessage': 'Hermes Studio {version} esta disponible.',
+    'update.availableDetail': 'Elige si deseas descargar esta actualizacion.',
     'update.downloading': 'La actualizacion se esta descargando en segundo plano.',
     'update.readyTitle': 'Actualizacion lista',
     'update.readyMessage': 'Hermes Studio {version} esta listo para instalarse.',
@@ -409,6 +424,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': 'Descargando {name}...',
     'runtime.verifying': 'Verificando runtime de Hermes...',
     'runtime.extracting': 'Extrayendo runtime de Hermes...',
+    'runtime.migrating': 'Moviendo Runtime y las versiones Web UI al directorio seleccionado...',
     'runtime.ready': 'Runtime de Hermes listo.',
     'common.ok': 'Aceptar',
     'common.cancel': 'Cancel',
@@ -435,6 +451,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': 'Aktuelle Version: {version}',
     'update.availableTitle': 'Update verfugbar',
     'update.availableMessage': 'Hermes Studio {version} ist verfugbar.',
+    'update.availableDetail': 'Wahlen Sie, ob Sie dieses Update herunterladen mochten.',
     'update.downloading': 'Das Update wird im Hintergrund heruntergeladen.',
     'update.readyTitle': 'Update bereit',
     'update.readyMessage': 'Hermes Studio {version} ist zur Installation bereit.',
@@ -461,6 +478,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': '{name} wird heruntergeladen...',
     'runtime.verifying': 'Hermes Runtime wird verifiziert...',
     'runtime.extracting': 'Hermes Runtime wird entpackt...',
+    'runtime.migrating': 'Runtime und Web-UI-Versionen werden in das ausgewahlte Speicherverzeichnis verschoben...',
     'runtime.ready': 'Hermes Runtime ist bereit.',
     'common.ok': 'OK',
     'common.cancel': 'Cancel',
@@ -487,6 +505,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'update.currentVersion': 'Versao atual: {version}',
     'update.availableTitle': 'Atualizacao disponivel',
     'update.availableMessage': 'Hermes Studio {version} esta disponivel.',
+    'update.availableDetail': 'Escolha se deseja baixar esta atualizacao.',
     'update.downloading': 'A atualizacao esta sendo baixada em segundo plano.',
     'update.readyTitle': 'Atualizacao pronta',
     'update.readyMessage': 'Hermes Studio {version} esta pronto para instalar.',
@@ -513,6 +532,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'runtime.downloadingPackage': 'Baixando {name}...',
     'runtime.verifying': 'Verificando runtime Hermes...',
     'runtime.extracting': 'Extraindo runtime Hermes...',
+    'runtime.migrating': 'Movendo o Runtime e as versoes Web UI para o diretorio selecionado...',
     'runtime.ready': 'Runtime Hermes pronto.',
     'common.ok': 'OK',
     'common.cancel': 'Cancel',
