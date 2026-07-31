@@ -3,7 +3,7 @@
   "info": {
     "title": "Hermes Studio API",
     "description": "Hermes Studio API — chat sessions, scheduled jobs, platform channels, model management, skills, memory, logs, file browser, group chat, and terminal.",
-    "version": "0.6.32"
+    "version": "0.6.35"
   },
   "servers": [
     {
@@ -159,6 +159,10 @@
     {
       "name": "Coding Agents",
       "description": "Coding agent installation, config, and runs"
+    },
+    {
+      "name": "Theme",
+      "description": "Per-user appearance settings and background image"
     },
     {
       "name": "API Docs",
@@ -3964,6 +3968,93 @@
         }
       }
     },
+    "/api/hermes/config/providers/{poolKey}/models/refresh": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Create refresh",
+        "description": "POST /api/hermes/config/providers/:poolKey/models/refresh",
+        "operationId": "refreshModels",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "poolKey",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "confirm": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hermes/config/providers/{poolKey}/models/restore": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Create restore",
+        "description": "POST /api/hermes/config/providers/:poolKey/models/restore",
+        "operationId": "restoreModels",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "poolKey",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
     "/api/hermes/custom-model": {
       "put": {
         "tags": [
@@ -4516,6 +4607,12 @@
                     "type": "number"
                   },
                   "inviteCode": {
+                    "type": "string"
+                  },
+                  "memberDescription": {
+                    "type": "string"
+                  },
+                  "memberName": {
                     "type": "string"
                   },
                   "name": {
@@ -6020,7 +6117,23 @@
         },
         "parameters": [
           {
+            "name": "board",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "task_id",
             "in": "query",
             "required": true,
             "schema": {
@@ -6820,6 +6933,102 @@
         }
       }
     },
+    "/api/hermes/kanban/{id}/attachments": {
+      "get": {
+        "tags": [
+          "Kanban"
+        ],
+        "summary": "Get attachments",
+        "description": "GET /api/hermes/kanban/:id/attachments",
+        "operationId": "listAttachments",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "board",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/hermes/kanban/{id}/attachments/{attachmentId}": {
+      "get": {
+        "tags": [
+          "Kanban"
+        ],
+        "summary": "Get :attachmentId",
+        "description": "GET /api/hermes/kanban/:id/attachments/:attachmentId",
+        "operationId": "readAttachment",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachmentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "board",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
     "/api/hermes/kanban/{id}/block": {
       "post": {
         "tags": [
@@ -7245,6 +7454,22 @@
             }
           },
           {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "event",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "level",
             "in": "query",
             "required": false,
@@ -7261,6 +7486,14 @@
             }
           },
           {
+            "name": "run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "session",
             "in": "query",
             "required": false,
@@ -7270,6 +7503,14 @@
           },
           {
             "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "text",
             "in": "query",
             "required": false,
             "schema": {
@@ -12364,6 +12605,142 @@
         ]
       }
     },
+    "/api/hermes/voice/proxy/{profile}/v1/audio/speech": {
+      "post": {
+        "tags": [
+          "TTS"
+        ],
+        "summary": "Create speech",
+        "description": "POST /api/hermes/voice/proxy/:profile/v1/audio/speech",
+        "operationId": "synthesizeVoiceProxyOpenAi",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "input": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hermes/voice/proxy/{profile}/v1/audio/transcriptions": {
+      "post": {
+        "tags": [
+          "STT"
+        ],
+        "summary": "Create transcriptions",
+        "description": "POST /api/hermes/voice/proxy/:profile/v1/audio/transcriptions",
+        "operationId": "transcribeVoiceProxy",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/hermes/voice/proxy/{profile}/v1/tts": {
+      "post": {
+        "tags": [
+          "TTS"
+        ],
+        "summary": "Create tts",
+        "description": "POST /api/hermes/voice/proxy/:profile/v1/tts",
+        "operationId": "synthesizeVoiceProxy",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hermes/weixin/qrcode": {
       "get": {
         "tags": [
@@ -12803,6 +13180,139 @@
           },
           "404": {
             "description": "Not found"
+          }
+        }
+      }
+    },
+    "/api/theme": {
+      "get": {
+        "tags": [
+          "Theme"
+        ],
+        "summary": "Get theme",
+        "description": "GET /api/theme",
+        "operationId": "getTheme",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Theme"
+        ],
+        "summary": "Update theme",
+        "description": "PUT /api/theme",
+        "operationId": "updateTheme",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/theme/background": {
+      "post": {
+        "tags": [
+          "Theme"
+        ],
+        "summary": "Create background",
+        "description": "POST /api/theme/background",
+        "operationId": "uploadThemeBackground",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Theme"
+        ],
+        "summary": "Get background",
+        "description": "GET /api/theme/background",
+        "operationId": "getThemeBackground",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Theme"
+        ],
+        "summary": "Delete background",
+        "description": "DELETE /api/theme/background",
+        "operationId": "deleteThemeBackground",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           }
         }
       }

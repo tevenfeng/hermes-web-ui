@@ -207,6 +207,8 @@ export const WORKFLOW_RUNS_SCHEMA: Record<string, string> = {
   snapshot_nodes_json: "TEXT NOT NULL DEFAULT '[]'",
   snapshot_edges_json: "TEXT NOT NULL DEFAULT '[]'",
   compiled_loops_json: "TEXT NOT NULL DEFAULT '[]'",
+  requested_timeout_ms: 'INTEGER',
+  deadline_at: 'INTEGER',
   started_at: 'INTEGER',
   finished_at: 'INTEGER',
   created_at: 'INTEGER NOT NULL',
@@ -235,6 +237,7 @@ export const WORKFLOW_RUN_NODE_SESSIONS_SCHEMA: Record<string, string> = {
   agent_mode: "TEXT NOT NULL DEFAULT ''",
   status: "TEXT NOT NULL DEFAULT 'queued'",
   sequence: 'INTEGER NOT NULL DEFAULT 0',
+  remaining_timeout_ms_at_start: 'INTEGER',
   started_at: 'INTEGER',
   finished_at: 'INTEGER',
   created_at: 'INTEGER NOT NULL',
@@ -372,6 +375,20 @@ export const USER_PROFILES_INDEXES = {
   idx_user_profiles_user: 'CREATE INDEX IF NOT EXISTS idx_user_profiles_user ON user_profiles(user_id)',
   idx_user_profiles_profile: 'CREATE INDEX IF NOT EXISTS idx_user_profiles_profile ON user_profiles(profile_name)',
   idx_user_profiles_default: 'CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_default ON user_profiles(user_id) WHERE is_default = 1',
+}
+
+export const USER_THEMES_TABLE = 'user_themes'
+
+export const USER_THEMES_SCHEMA: Record<string, string> = {
+  user_id: 'INTEGER PRIMARY KEY',
+  font_size: 'INTEGER NOT NULL DEFAULT 14',
+  text_color: 'TEXT',
+  accent_color: 'TEXT',
+  background_filename: 'TEXT',
+  background_original_name: 'TEXT',
+  background_mime: 'TEXT',
+  created_at: 'INTEGER NOT NULL',
+  updated_at: 'INTEGER NOT NULL',
 }
 
 // ============================================================================
@@ -1089,6 +1106,7 @@ export function initAllHermesTables(): void {
       primaryKey: 'user_id, profile_name',
       indexes: USER_PROFILES_INDEXES,
     })
+    syncTable(USER_THEMES_TABLE, USER_THEMES_SCHEMA)
 
     // LAN devices and link request status
     syncTable(DEVICES_TABLE, DEVICES_SCHEMA, {

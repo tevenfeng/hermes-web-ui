@@ -14,6 +14,7 @@ import es from '@/i18n/locales/es'
 import de from '@/i18n/locales/de'
 import pt from '@/i18n/locales/pt'
 import ru from '@/i18n/locales/ru'
+import ar from '@/i18n/locales/ar'
 import { createI18n } from 'vue-i18n'
 
 const SOURCE_ROOT = join(process.cwd(), 'packages/client/src')
@@ -31,6 +32,7 @@ const rawMessages: Record<string, Record<string, unknown>> = {
   de,
   pt,
   ru,
+  ar,
 }
 
 const messages: Record<string, Record<string, unknown>> = {}
@@ -138,8 +140,27 @@ const APPROVAL_AND_WRITE_GATE_LOCALIZED_KEYS = [
   'settings.session.skillsWriteApproval',
 ]
 
+const KANBAN_ARCHIVE_LOCALIZED_KEYS = [
+  'kanban.board.defaultArchiveUnavailable',
+  'kanban.action.archive',
+  'kanban.action.archiveConfirm',
+  'kanban.message.taskArchived',
+]
+
 const JOURNEY_DISTINCT_LOCALIZED_KEYS = [
   'journey.nodeKinds',
+]
+
+const PROVIDER_MODEL_REFRESH_LOCALIZED_KEYS = [
+  'models.refreshModels',
+  'models.restoreModels',
+  'models.refreshModelsConfirmTitle',
+  'models.refreshModelsConfirmContent',
+  'models.refreshModelsConfirmAction',
+  'models.refreshModelsSuccess',
+  'models.refreshModelsFailed',
+  'models.restoreModelsSuccess',
+  'models.restoreModelsFailed',
 ]
 
 const PLATFORM_SETTINGS_LOCALE_SPECIFIC_LOCALIZED_KEYS: Record<string, string[]> = {
@@ -304,11 +325,39 @@ describe('i18n locale coverage', () => {
     expect(untranslated).toEqual([])
   })
 
+  it('localizes Kanban archive copy in every raw non-English locale', () => {
+    const untranslated = Object.entries(rawMessages).flatMap(([locale, localeMessages]) => {
+      if (locale === 'en') return []
+
+      return KANBAN_ARCHIVE_LOCALIZED_KEYS.flatMap((key) => {
+        const localeValue = getPath(localeMessages, key)
+        if (typeof localeValue === 'undefined') return [`${locale}: ${key} missing`]
+        return localeValue === getPath(en, key) ? [`${locale}: ${key}`] : []
+      })
+    })
+
+    expect(untranslated).toEqual([])
+  })
+
   it('localizes Journey node-kind copy in every raw non-English locale', () => {
     const untranslated = Object.entries(rawMessages).flatMap(([locale, localeMessages]) => {
       if (locale === 'en') return []
 
       return JOURNEY_DISTINCT_LOCALIZED_KEYS.flatMap((key) => {
+        const localeValue = getPath(localeMessages, key)
+        if (typeof localeValue === 'undefined') return [`${locale}: ${key} missing`]
+        return localeValue === getPath(en, key) ? [`${locale}: ${key}`] : []
+      })
+    })
+
+    expect(untranslated).toEqual([])
+  })
+
+  it('localizes provider model refresh copy in every raw non-English locale', () => {
+    const untranslated = Object.entries(rawMessages).flatMap(([locale, localeMessages]) => {
+      if (locale === 'en') return []
+
+      return PROVIDER_MODEL_REFRESH_LOCALIZED_KEYS.flatMap((key) => {
         const localeValue = getPath(localeMessages, key)
         if (typeof localeValue === 'undefined') return [`${locale}: ${key} missing`]
         return localeValue === getPath(en, key) ? [`${locale}: ${key}`] : []

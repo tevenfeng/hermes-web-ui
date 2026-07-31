@@ -54,10 +54,19 @@ import { isStoredSuperAdmin } from "@/api/client";
 import { useDefaultWorkspace } from "@/composables/useDefaultWorkspace";
 import { canScopedCodingAgentUseProvider, usesServerManagedProviderAuth } from "@/utils/codingAgentProviders";
 import { OPEN_SUBAGENT_STREAM_EVENT, type OpenSubagentStreamDetail } from "@/utils/hermes/subagent-stream";
+import { desktopBridge, hasDesktopBrowserBridge } from "@/utils/desktop-bridge";
+import { OPEN_DESKTOP_BROWSER_PANEL_EVENT } from "@/utils/desktop-browser";
+
+const props = withDefaults(defineProps<{
+  standalone?: boolean;
+}>(), {
+  standalone: false,
+});
 
 const FilesPanel = defineAsyncComponent(async () => (await import('./FilesPanel.vue')).default);
 const FilePreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/FilePreview.vue')).default);
 const WorkspaceDiffPreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/WorkspaceDiffPreview.vue')).default);
+const DesktopBrowserPanel = defineAsyncComponent(async () => (await import('./DesktopBrowserPanel.vue')).default);
 
 const chatStore = useChatStore();
 const appStore = useAppStore();
@@ -73,14 +82,20 @@ const isSuperAdmin = computed(() => isStoredSuperAdmin());
 const showOutline = ref(false);
 const showRealtimeVoice = ref(false);
 const messageListRef = ref<InstanceType<typeof MessageList> | null>(null);
-const chatInputRef = ref<(InstanceType<typeof ChatInput> & { addFiles?: (files: File[]) => void }) | null>(null);
+const chatInputRef = ref<(InstanceType<typeof ChatInput> & {
+  addFiles?: (files: File[]) => void;
+  addBrowserAttachment?: (file: File, context: string) => void;
+}) | null>(null);
 const chatContentWrapperRef = ref<HTMLElement | null>(null);
 const chatMainContentRef = ref<HTMLElement | null>(null);
 let sessionFadeAnimation: Animation | null = null;
 const chatDropCounter = ref(0);
 const isChatDropActive = ref(false);
 const showToolPanel = ref(false);
-const activeToolPanel = ref<"files" | "terminal">("files");
+const activeToolPanel = ref<"files" | "terminal" | "browser">("files");
+const desktopBrowserAvailable = hasDesktopBrowserBridge();
+const desktopChatWindowAvailable = desktopBridge()?.isDesktop === true
+  && typeof desktopBridge()?.openChatWindow === "function";
 const selectedSubagent = ref<OpenSubagentStreamDetail | null>(null);
 const selectedSubagentStream = computed(() => {
   const selected = selectedSubagent.value;
@@ -93,7 +108,7 @@ const TOOL_PANEL_MIN_WIDTH = 360;
 const TOOL_PANEL_DEFAULT_WIDTH = 560;
 const TOOL_PANEL_STORAGE_KEY = "hermes.chat.toolPanelWidth";
 const toolPanelWidth = ref(loadToolPanelWidth());
-const toolResizeStart = ref<{ x: number; width: number } | null>(null);
+const toolResizeStart = ref<{ x: number; width: number; deltaSign: 1 | -1 } | null>(null);
 
 const currentMode = ref<"chat" | "live">("chat");
 
@@ -110,8 +125,13 @@ const isBatchDeleting = ref(false);
 // where the session list covers the chat content ("auto-fixes after a
 // moment" — that was the race).
 const showSessions = ref(
-  typeof window === "undefined" ||
-    !window.matchMedia("(max-width: 768px)").matches,
+  !props.standalone && (
+    typeof window === "undefined" ||
+    !window.matchMedia("(max-width: 768px)").matches
+  )
+);
+const pageSidebarExpanded = computed(
+  () => !props.standalone && currentMode.value === "chat" && showSessions.value,
 );
 let mobileQuery: MediaQueryList | null = null;
 const isMobile = ref(false);
@@ -137,6 +157,11 @@ function sessionHref(sessionId: string) {
 
 function openSessionInNewTab(sessionId: string) {
   if (typeof window === "undefined") return;
+  const bridge = desktopBridge();
+  if (bridge?.isDesktop && bridge.openChatWindow) {
+    void bridge.openChatWindow(sessionId, sessionProfile(sessionId) || undefined);
+    return;
+  }
   window.open(sessionHref(sessionId), "_blank", "noopener,noreferrer");
 }
 
@@ -175,7 +200,7 @@ function handleToolPanelViewportResize() {
 function handleToolResizeMove(event: PointerEvent) {
   const start = toolResizeStart.value;
   if (!start) return;
-  const delta = start.x - event.clientX;
+  const delta = (event.clientX - start.x) * start.deltaSign;
   toolPanelWidth.value = clampToolPanelWidth(start.width + delta);
 }
 
@@ -197,6 +222,7 @@ function startToolResize(event: PointerEvent) {
   toolResizeStart.value = {
     x: event.clientX,
     width: toolPanelWidth.value,
+    deltaSign: document.documentElement.dir === "rtl" ? 1 : -1,
   };
   window.addEventListener("pointermove", handleToolResizeMove);
   window.addEventListener("pointerup", stopToolResize);
@@ -263,6 +289,14 @@ function handleChatDrop(event: DragEvent) {
   chatInputRef.value?.addFiles?.(files);
 }
 
+function handleWorkspaceFileAttach(file: File) {
+  chatInputRef.value?.addFiles?.([file]);
+}
+
+function handleBrowserAttachment(payload: { file: File; context: string }) {
+  chatInputRef.value?.addBrowserAttachment?.(payload.file, payload.context);
+}
+
 async function handleSessionClick(sessionId: string) {
   chatStore.clearSessionCompletedUnread(sessionId);
   await router.push({
@@ -285,6 +319,12 @@ function handleMobileChange(e: MediaQueryListEvent | MediaQueryList) {
 function openPageSidebar() {
   showSessions.value = true;
 }
+
+watch(
+  pageSidebarExpanded,
+  (expanded) => appStore.setPageSidebarExpanded(expanded),
+  { immediate: true },
+);
 
 function workspacePreviewPath(filePath: string): string | null {
   const workspace = activeWorkspacePath.value?.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -336,19 +376,34 @@ function handleOpenSubagentStreamRequest(event: Event) {
   showToolPanel.value = true;
 }
 
+function handleOpenDesktopBrowserPanelRequest() {
+  if (!desktopBrowserAvailable) return;
+  if (toolPanelStore.workspaceDiff && filesStore.hasUnsavedChanges) {
+    message.warning(t("files.unsavedChanges"));
+    return;
+  }
+  if (toolPanelStore.workspaceDiff && filesStore.editingFile) filesStore.closeEditor();
+  filesStore.closePreview();
+  toolPanelStore.closeWorkspaceDiff();
+  selectedSubagent.value = null;
+  activeToolPanel.value = "browser";
+  showToolPanel.value = true;
+}
+
 onMounted(() => {
   mobileQuery = window.matchMedia("(max-width: 768px)");
   handleMobileChange(mobileQuery);
   mobileQuery.addEventListener("change", handleMobileChange);
   window.addEventListener("hermes:open-page-sidebar", openPageSidebar);
   window.addEventListener("hermes:preview-workspace-file", handleWorkspaceFilePreviewRequest);
+  window.addEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest);
   window.addEventListener(OPEN_SUBAGENT_STREAM_EVENT, handleOpenSubagentStreamRequest);
   window.addEventListener("resize", handleToolPanelViewportResize);
   handleToolPanelViewportResize();
   if (profilesStore.profiles.length === 0) {
     void profilesStore.fetchProfiles();
   }
-  void loadSessionCategories();
+  if (!props.standalone) void loadSessionCategories();
 });
 
 watch(
@@ -383,6 +438,7 @@ onUnmounted(() => {
   mobileQuery?.removeEventListener("change", handleMobileChange);
   window.removeEventListener("hermes:open-page-sidebar", openPageSidebar);
   window.removeEventListener("hermes:preview-workspace-file", handleWorkspaceFilePreviewRequest);
+  window.removeEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest);
   window.removeEventListener(OPEN_SUBAGENT_STREAM_EVENT, handleOpenSubagentStreamRequest);
   window.removeEventListener("resize", handleToolPanelViewportResize);
   stopToolResize();
@@ -727,16 +783,12 @@ const hiddenDefaultWorkspaces = computed(() => {
   return defaultWorkspaces.value.filter(ws => !visible.has(ws));
 });
 
-const showEkkoAgentEntry = import.meta.env.DEV;
-const newChatAgentOptions = computed(() => {
-  const options = [
-    { label: "Hermes", value: "hermes" },
-    { label: "Claude Code", value: "claude-code" },
-    { label: "Codex", value: "codex" },
-  ];
-  if (showEkkoAgentEntry) options.push({ label: "Ekko Agent", value: "ekko-agent" });
-  return options;
-});
+const newChatAgentOptions = computed(() => [
+  { label: "Hermes", value: "hermes" },
+  { label: "Claude Code", value: "claude-code" },
+  { label: "Codex", value: "codex" },
+  { label: "Ekko Agent", value: "ekko-agent" },
+]);
 
 const newChatApiModeOptions = computed(() => [
   { label: t("codingAgents.protocolOpenAiChat"), value: "chat_completions" },
@@ -871,7 +923,7 @@ const canConfirmNewChat = computed(() => {
   if (!newChatUsesProviderModel.value) return true;
   if (!newChatProvider.value || !newChatModel.value) return false;
   if (!isNewChatCodingAgent.value) return true;
-  if (isNewChatExternalCodingAgent.value && !newChatApiMode.value) return false;
+  if (isNewChatCodingAgent.value && effectiveNewChatAgentMode.value === "scoped" && !newChatApiMode.value) return false;
   if (newChatNeedsBaseUrl.value && !newChatBaseUrl.value.trim()) return false;
   if (newChatNeedsApiKey.value && !newChatApiKey.value.trim()) return false;
   return true;
@@ -1042,7 +1094,7 @@ async function confirmNewChat() {
     categoryId: newChatCategoryId.value,
     baseUrl: source === "coding_agent" && !isGlobalCodingAgent ? group?.base_url || newChatBaseUrl.value.trim() || undefined : undefined,
     apiKey: source === "coding_agent" && !isGlobalCodingAgent ? group?.api_key || newChatApiKey.value.trim() || undefined : undefined,
-    apiMode: isNewChatExternalCodingAgent.value && !isGlobalCodingAgent ? newChatApiMode.value : undefined,
+    apiMode: isNewChatCodingAgent.value && !isGlobalCodingAgent ? newChatApiMode.value : undefined,
   });
   // Record workspace to recent list
   if (newChatWorkspace.value && workspaceComposable) {
@@ -1333,7 +1385,12 @@ const contextMenuOptions = computed(() => {
       },
     ],
   })
-  options.push({ label: t("chat.openSessionInNewTab"), key: "open-link" })
+  options.push({
+    label: t(desktopChatWindowAvailable
+      ? "chat.openSessionInNewWindow"
+      : "chat.openSessionInNewTab"),
+    key: "open-link",
+  })
   options.push({ label: t("chat.copySessionLink"), key: "copy-link" })
   options.push({ label: t("chat.copySessionId"), key: "copy-id" })
   return options
@@ -1535,11 +1592,6 @@ const sessionModelCodingAgentId = computed<ChatCodingAgentId | undefined>(() =>
         ? "ekko-agent"
         : undefined),
 );
-const isSessionModelExternalCodingAgent = computed(() =>
-  isSessionModelScopedCodingAgent.value &&
-  (sessionModelCodingAgentId.value === "claude-code" || sessionModelCodingAgentId.value === "codex"),
-);
-
 const isSessionModelCodingAgent = computed(() =>
   sessionModelSession.value?.source === "coding_agent" || Boolean(sessionModelSession.value?.codingAgentId),
 );
@@ -1708,7 +1760,7 @@ async function applySessionModelSwitch(model: string, provider: string, apiMode?
 async function selectSessionModel(model: string, provider: string) {
   const meta = sessionModelBaseGroups.value.find((group) => group.provider === provider)?.model_meta?.[model];
   if (meta?.disabled || !sessionModelSessionId.value || sessionModelSwitching.value) return;
-  if (isSessionModelExternalCodingAgent.value) {
+  if (isSessionModelScopedCodingAgent.value) {
     pendingSessionModelSwitch.value = { model, provider };
     sessionModelApiMode.value = sessionModelSession.value?.provider === provider && sessionModelSession.value.apiMode
       ? normalizeCodingAgentApiMode(sessionModelSession.value.apiMode, defaultSessionModelApiMode(provider))
@@ -1745,15 +1797,15 @@ async function handleSessionModelCustomSubmit() {
 </script>
 
 <template>
-  <div class="chat-panel">
+  <div class="chat-panel" :class="{ 'chat-panel--standalone': standalone }">
     <div
-      v-if="currentMode === 'chat'"
+      v-if="currentMode === 'chat' && !standalone"
       class="session-backdrop"
       :class="{ active: showSessions }"
       @click="showSessions = false"
     />
     <aside
-      v-if="currentMode === 'chat'"
+      v-if="currentMode === 'chat' && !standalone"
       class="session-list"
       :class="{ collapsed: !showSessions }"
     >
@@ -1911,7 +1963,9 @@ async function handleSessionModelCustomSubmit() {
             :selected="isSessionSelected(s)"
             :show-profile="true"
             :to="sessionHref(s.id)"
+            :intercept-modified-navigation="desktopChatWindowAvailable"
             @select="handleSessionClick(s.id)"
+            @open-new="openSessionInNewTab(s.id)"
             @contextmenu="handleContextMenu($event, s.id)"
             @delete="handleDeleteSession(s.id)"
             @toggle-select="toggleSessionSelection(s)"
@@ -1956,7 +2010,9 @@ async function handleSessionModelCustomSubmit() {
               :selected="isSessionSelected(s)"
               :show-profile="true"
               :to="sessionHref(s.id)"
+              :intercept-modified-navigation="desktopChatWindowAvailable"
               @select="handleSessionClick(s.id)"
+              @open-new="openSessionInNewTab(s.id)"
               @contextmenu="handleContextMenu($event, s.id)"
               @delete="handleDeleteSession(s.id)"
               @toggle-select="toggleSessionSelection(s)"
@@ -2155,28 +2211,6 @@ async function handleSessionModelCustomSubmit() {
         <div v-if="filteredSessionModelGroups.length === 0" class="session-model-empty">
           {{ sessionModelSearch ? 'No results' : 'No models' }}
         </div>
-        <div class="session-model-custom">
-          <div class="session-model-custom-row">
-            <NSelect
-              v-model:value="sessionModelCustomProvider"
-              :options="sessionModelProviderOptions"
-              :disabled="sessionModelSwitching"
-              size="small"
-              class="session-model-custom-provider"
-            />
-            <NInput
-              v-model:value="sessionModelCustomInput"
-              :placeholder="t('models.customModelPlaceholder')"
-              :disabled="sessionModelSwitching"
-              size="small"
-              class="session-model-custom-input"
-              @keydown.enter="handleSessionModelCustomSubmit"
-            />
-          </div>
-          <div class="session-model-custom-hint">
-            {{ t('models.customModelHint') }}
-          </div>
-        </div>
         </div>
         <div v-else class="session-model-list" :aria-busy="sessionModelSwitching">
           <div class="session-model-group-items session-moa-items">
@@ -2212,6 +2246,28 @@ async function handleSessionModelCustomSubmit() {
           </div>
           <div v-if="filteredSessionMoaModels.length === 0" class="session-model-empty">
             {{ t('chat.noMoaPresets') }}
+          </div>
+        </div>
+        <div v-if="sessionModelKind === 'model'" class="session-model-custom">
+          <div class="session-model-custom-row">
+            <NSelect
+              v-model:value="sessionModelCustomProvider"
+              :options="sessionModelProviderOptions"
+              :disabled="sessionModelSwitching"
+              size="small"
+              class="session-model-custom-provider"
+            />
+            <NInput
+              v-model:value="sessionModelCustomInput"
+              :placeholder="t('models.customModelPlaceholder')"
+              :disabled="sessionModelSwitching"
+              size="small"
+              class="session-model-custom-input"
+              @keydown.enter="handleSessionModelCustomSubmit"
+            />
+          </div>
+          <div class="session-model-custom-hint">
+            {{ t('models.customModelHint') }}
           </div>
         </div>
       </NSpin>
@@ -2324,7 +2380,7 @@ async function handleSessionModelCustomSubmit() {
               filterable
             />
           </label>
-          <label v-if="isNewChatExternalCodingAgent && effectiveNewChatAgentMode === 'scoped'" class="new-chat-field">
+          <label v-if="isNewChatCodingAgent && effectiveNewChatAgentMode === 'scoped'" class="new-chat-field">
             <span class="new-chat-label">{{ t("codingAgents.protocolScope") }}</span>
             <NSelect
               v-model:value="newChatApiMode"
@@ -2448,7 +2504,7 @@ async function handleSessionModelCustomSubmit() {
       class="chat-main"
       :class="{ 'chat-main--sidebar-collapsed': currentMode !== 'chat' || !showSessions }"
     >
-      <header class="chat-header">
+      <header v-if="!standalone" class="chat-header">
         <div class="header-left">
           <NButton
             v-if="currentMode === 'chat'"
@@ -2522,7 +2578,7 @@ async function handleSessionModelCustomSubmit() {
                   </template>
                 </NButton>
               </template>
-              {{ t("drawer.files") }} / {{ t("drawer.terminal") }}
+              {{ desktopBrowserAvailable ? `${t("drawer.files")} / ${t("drawer.terminal")} / ${t("browser.title")}` : `${t("drawer.files")} / ${t("drawer.terminal")}` }}
             </NTooltip>
             <NTooltip trigger="hover">
               <template #trigger>
@@ -2593,6 +2649,7 @@ async function handleSessionModelCustomSubmit() {
             <MessageList
               ref="messageListRef"
               :approval-portal-to-body="showRealtimeVoice"
+              scroll-scope="chat"
             />
             <ChatInput
               ref="chatInputRef"
@@ -2636,20 +2693,47 @@ async function handleSessionModelCustomSubmit() {
                     :class="{ active: activeToolPanel === 'files' }"
                     type="button"
                     role="tab"
+                    :title="t('drawer.files')"
+                    :aria-label="t('drawer.files')"
                     :aria-selected="activeToolPanel === 'files'"
                     @click="activeToolPanel = 'files'"
                   >
-                    {{ t("drawer.files") }}
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
+                    </svg>
                   </button>
                   <button
                     class="chat-tool-tab"
                     :class="{ active: activeToolPanel === 'terminal' }"
                     type="button"
                     role="tab"
+                    :title="t('drawer.terminal')"
+                    :aria-label="t('drawer.terminal')"
                     :aria-selected="activeToolPanel === 'terminal'"
                     @click="activeToolPanel = 'terminal'"
                   >
-                    {{ t("drawer.terminal") }}
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="3" y="4" width="18" height="16" rx="2" />
+                      <path d="m7 9 3 3-3 3M13 15h4" />
+                    </svg>
+                  </button>
+                  <button
+                    v-if="desktopBrowserAvailable"
+                    class="chat-tool-tab"
+                    :class="{ active: activeToolPanel === 'browser' }"
+                    type="button"
+                    role="tab"
+                    :title="t('browser.title')"
+                    :aria-label="t('browser.title')"
+                    :aria-selected="activeToolPanel === 'browser'"
+                    @click="activeToolPanel = 'browser'"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="3" y="4" width="18" height="16" rx="2" />
+                      <path d="M3 9h18" />
+                      <circle cx="6.5" cy="6.5" r=".75" fill="currentColor" stroke="none" />
+                      <circle cx="9.5" cy="6.5" r=".75" fill="currentColor" stroke="none" />
+                    </svg>
                   </button>
                 </div>
                 <div class="chat-tool-content">
@@ -2657,10 +2741,15 @@ async function handleSessionModelCustomSubmit() {
                     v-show="activeToolPanel === 'files'"
                     :workspace-session-id="activeWorkspaceSessionId"
                     :workspace="activeWorkspacePath"
+                    @attach="handleWorkspaceFileAttach"
                   />
                   <TerminalPanel
                     v-show="activeToolPanel === 'terminal'"
                     :visible="showToolPanel && activeToolPanel === 'terminal'"
+                  />
+                  <DesktopBrowserPanel
+                    v-if="desktopBrowserAvailable && activeToolPanel === 'browser'"
+                    @attach="handleBrowserAttachment"
                   />
                 </div>
               </template>
@@ -2764,11 +2853,11 @@ async function handleSessionModelCustomSubmit() {
 }
 
 .session-model-group-items {
-  padding-left: 8px;
+  padding-inline-start: 8px;
 }
 
 .session-moa-items {
-  padding-left: 0;
+  padding-inline-start: 0;
 }
 
 .session-model-item {
@@ -2846,7 +2935,7 @@ async function handleSessionModelCustomSubmit() {
   font-weight: 600;
   padding: 1px 5px;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   letter-spacing: 0.03em;
 }
 
@@ -2919,8 +3008,8 @@ async function handleSessionModelCustomSubmit() {
 
   &.collapsed {
     width: 0;
-    margin-left: 0;
-    margin-right: 0;
+    margin-inline-start: 0;
+    margin-inline-end: 0;
     border: none;
     box-shadow: none;
     opacity: 0;
@@ -3284,7 +3373,7 @@ async function handleSessionModelCustomSubmit() {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
 
   &--sidebar-collapsed {
-    margin-left: 10px;
+    margin-inline-start: 10px;
   }
 
   @media (max-width: $breakpoint-mobile) {
@@ -3384,7 +3473,7 @@ async function handleSessionModelCustomSubmit() {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
 }
 
 @media (max-width: $breakpoint-mobile) {
@@ -3445,7 +3534,7 @@ async function handleSessionModelCustomSubmit() {
   min-width: 320px;
   max-width: 100%;
   background: $bg-card;
-  border-left: 1px solid $border-color;
+  border-inline-start: 1px solid $border-color;
   display: flex;
   min-height: 0;
   overflow: visible;
@@ -3453,7 +3542,7 @@ async function handleSessionModelCustomSubmit() {
 
 .chat-tool-resize-handle {
   position: absolute;
-  left: -7px;
+  inset-inline-start: -7px;
   top: 0;
   bottom: 0;
   width: 14px;
@@ -3463,7 +3552,7 @@ async function handleSessionModelCustomSubmit() {
   &::after {
     content: "";
     position: absolute;
-    left: 6px;
+    inset-inline-start: 6px;
     top: 0;
     bottom: 0;
     width: 1px;
@@ -3477,7 +3566,7 @@ async function handleSessionModelCustomSubmit() {
   &::before {
     content: "";
     position: absolute;
-    left: 1px;
+    inset-inline-start: 1px;
     top: 50%;
     width: 12px;
     height: 38px;
@@ -3513,33 +3602,52 @@ async function handleSessionModelCustomSubmit() {
 
 .chat-tool-panel-inner {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   flex: 1;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: $bg-main-surface;
 }
 
 .chat-tool-tabs {
   display: flex;
+  flex-direction: column;
   align-items: center;
   flex-shrink: 0;
-  gap: 6px;
-  padding: 8px 10px;
-  border-bottom: 1px solid $border-color;
+  order: 2;
+  width: 48px;
+  height: 100%;
+  gap: 4px;
+  padding: 8px 6px;
+  border-inline-start: 1px solid $border-color;
+  background: $bg-sidebar-surface;
+  box-sizing: border-box;
 }
 
 .chat-tool-tab {
-  height: 30px;
-  padding: 0 12px;
+  position: relative;
+  width: 36px;
+  height: 36px;
+  padding: 0;
   border: none;
   border-radius: $radius-sm;
   background: transparent;
   color: $text-secondary;
   cursor: pointer;
-  font-size: 13px;
-  font-weight: 500;
+  display: grid;
+  place-items: center;
   transition: all $transition-fast;
+
+  svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
 
   &:hover {
     color: $text-primary;
@@ -3549,14 +3657,27 @@ async function handleSessionModelCustomSubmit() {
   &.active {
     color: var(--accent-primary);
     background: rgba(var(--accent-primary-rgb), 0.12);
+
+    &::after {
+      content: "";
+      position: absolute;
+      right: -6px;
+      top: 9px;
+      bottom: 9px;
+      width: 2px;
+      border-radius: 2px 0 0 2px;
+      background: var(--accent-primary);
+    }
   }
 }
 
 .chat-tool-content {
+  order: 1;
   flex: 1;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  background: $bg-main-surface;
 }
 
 .chat-tool-content > * {
@@ -3574,7 +3695,7 @@ async function handleSessionModelCustomSubmit() {
     left: 0;
     width: 100% !important;
     min-width: 0;
-    border-left: none;
+    border-inline-start: none;
     box-shadow: none;
   }
 
@@ -3696,7 +3817,7 @@ async function handleSessionModelCustomSubmit() {
 
 .workspace-default-badge {
   display: inline-block;
-  margin-left: 6px;
+  margin-inline-start: 6px;
   padding: 1px 6px;
   font-size: 10px;
   font-weight: 600;

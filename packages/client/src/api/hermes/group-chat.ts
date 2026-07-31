@@ -179,6 +179,8 @@ export function disconnectGroupChat(): void {
 export async function createRoom(data: {
     name: string
     inviteCode: string
+    memberName?: string
+    memberDescription?: string
     agents?: { profile: string; name?: string; description?: string; invited?: boolean }[]
     compression?: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }
     workspace?: string
@@ -300,6 +302,14 @@ export async function readGroupWorkspaceFile(roomId: string, path: string): Prom
 
 export async function fetchGroupWorkspaceFileBlob(roomId: string, path: string, signal?: AbortSignal): Promise<Blob> {
     const params = new URLSearchParams({ path })
+    return fetchAuthenticatedBlob(
+        `/api/hermes/group-chat/rooms/${encodeURIComponent(roomId)}/workspace-file/content?${params}`,
+        { signal },
+    )
+}
+
+export async function fetchGroupWorkspaceAttachmentBlob(roomId: string, path: string, signal?: AbortSignal): Promise<Blob> {
+    const params = new URLSearchParams({ path, download: '1' })
     return fetchAuthenticatedBlob(
         `/api/hermes/group-chat/rooms/${encodeURIComponent(roomId)}/workspace-file/content?${params}`,
         { signal },

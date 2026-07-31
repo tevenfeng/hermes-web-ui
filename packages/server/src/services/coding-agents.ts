@@ -1,5 +1,5 @@
 import { execFile } from 'child_process'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { existsSync, readdirSync, realpathSync } from 'fs'
 import { chmod, mkdir, readFile, stat, writeFile } from 'fs/promises'
 import { homedir } from 'os'
@@ -10,7 +10,7 @@ import { PROVIDER_ENV_MAP, readConfigYamlForProfile, safeReadFile } from './conf
 import { getCompatibleCustomProviders } from './hermes/custom-providers-compat'
 import { registerClaudeCodeProxyTarget } from './agent-runner/proxies/claude-code-proxy'
 import { registerCodexProxyTarget } from './agent-runner/proxies/codex-proxy'
-import type { ApiMode } from './agent-runner/types'
+import type { ApiMode, CodingAgentImageInput } from './agent-runner/types'
 import { PROVIDER_PRESETS } from '../shared/providers'
 import { getModelContextLength } from './hermes/model-context'
 import { getProfileDir } from './hermes/hermes-profile'
@@ -31,11 +31,12 @@ const POSIX_LAUNCHER_FILE = 'launch.sh'
 const WINDOWS_LAUNCHER_FILE = 'launch.ps1'
 const CLAUDE_CODE_SKIP_PERMISSIONS_ARGS = ['--dangerously-skip-permissions']
 const CLAUDE_CODE_ROOT_PERMISSION_ARGS = ['--permission-mode', 'auto']
-const HERMES_MCP_SERVERS = [
+const HERMES_MCP_SERVERS: ReadonlyArray<{ name: string; toolset: string }> = [
   { name: 'hermes-studio-api', toolset: 'api' },
+  { name: 'hermes-studio-browser', toolset: 'browser' },
   { name: 'hermes-studio-devices', toolset: 'devices' },
   { name: 'hermes-studio-use', toolset: 'use' },
-] as const
+]
 const HERMES_MCP_SERVER_NAMES: Set<string> = new Set(HERMES_MCP_SERVERS.map(server => server.name))
 const LEGACY_HERMES_MCP_SERVER_NAMES = new Set(['hermes-studio', 'hermes-studio-mcp', 'hermes-web-ui-mcp'])
 const LEGACY_HERMES_MCP_COMMANDS = new Set([
@@ -385,6 +386,21 @@ function normalizeScopeSegment(value: string | undefined, fallback: string, labe
   return segment
 }
 
+function normalizeProviderIdentity(value: string | undefined): string {
+  const provider = String(value || '').trim() || 'default'
+  if (/[\x00-\x1f\x7f-\x9f]/.test(provider)) {
+    const err = new Error('Invalid provider')
+    ;(err as any).status = 400
+    throw err
+  }
+  if (provider.length > 128) {
+    const err = new Error('provider is too long')
+    ;(err as any).status = 400
+    throw err
+  }
+  return provider
+}
+
 function normalizeConfigScope(scope: CodingAgentConfigScope = {}): Required<CodingAgentConfigScope> {
   return {
     profile: normalizeScopeSegment(scope.profile, 'default', 'profile'),
@@ -603,6 +619,21 @@ function getScopedConfigRoot(id: CodingAgentId, scope: Required<CodingAgentConfi
   return join(getWebUiHome(), CODING_AGENT_HOME_DIR, 'model', scope.profile, scope.provider, id)
 }
 
+function getScopedRuntimeConfigRoot(
+  id: CodingAgentId,
+  scope: Required<CodingAgentConfigScope>,
+  input: Pick<CodingAgentLaunchInput, 'sessionId' | 'agentSessionId'>,
+): string {
+  const rootDir = getScopedConfigRoot(id, scope)
+  const sessionId = String(input.sessionId || '').trim()
+  const agentSessionId = String(input.agentSessionId || '').trim()
+  if (!sessionId || !agentSessionId) return rootDir
+  const runtimeKey = createHash('sha256')
+    .update(JSON.stringify([sessionId, agentSessionId]))
+    .digest('hex')
+  return join(rootDir, 'runs', runtimeKey)
+}
+
 function getScopedWorkspaceRoot(scope: Required<CodingAgentConfigScope>): string {
   return join(getWebUiHome(), CODING_AGENT_HOME_DIR, 'workspace', scope.profile, scope.provider)
 }
@@ -682,7 +713,7 @@ function codexCatalogEntry(input: {
     max_context_window: input.contextWindow,
     effective_context_window_percent: 95,
     experimental_supported_tools: [],
-    input_modalities: ['text'],
+    input_modalities: ['text', 'image'],
     supports_search_tool: true,
   }
 }
@@ -1183,13 +1214,18 @@ function getLiveConfigFileDefinition(id: string, key: string): CodingAgentConfig
   }
 }
 
-function getScopedConfigFileDefinition(id: string, key: string, scopeInput: CodingAgentConfigScope = {}): (CodingAgentConfigFileDefinition & Required<CodingAgentConfigScope> & { rootDir: string }) | null {
+function getScopedConfigFileDefinition(
+  id: string,
+  key: string,
+  scopeInput: CodingAgentConfigScope = {},
+  rootDirOverride?: string,
+): (CodingAgentConfigFileDefinition & Required<CodingAgentConfigScope> & { rootDir: string }) | null {
   const tool = getCodingAgentDefinition(id)
   if (!tool) return null
   const definition = CONFIG_FILE_DEFINITIONS[tool.id].find(file => file.key === key)
   if (!definition) return null
   const scope = normalizeConfigScope(scopeInput)
-  const rootDir = getScopedConfigRoot(tool.id, scope)
+  const rootDir = rootDirOverride || getScopedConfigRoot(tool.id, scope)
   return {
     key: definition.key,
     path: definition.path,
@@ -1632,7 +1668,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     }
   }
 
-  const provider = normalizeScopeSegment(input.provider, 'default', 'provider')
+  const provider = normalizeProviderIdentity(input.provider)
   const scope = normalizeConfigScope({ profile: input.profile, provider })
   const model = String(input.model || '').trim()
   const apiKey = String(input.apiKey || '').trim()
@@ -1647,14 +1683,14 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
   const preset = PROVIDER_PRESETS.find(item => item.value === provider)
   const apiMode = normalizeLaunchApiMode(input.apiMode, preset?.api_mode || 'chat_completions')
   const reasoningEffort = String(input.reasoningEffort || '').trim()
-  const rootDir = getScopedConfigRoot(tool.id, scope)
+  const rootDir = getScopedRuntimeConfigRoot(tool.id, scope, input)
   const workspaceDir = resolveLaunchWorkspaceRoot(scope, input.workspace)
   await mkdir(rootDir, { recursive: true })
   await mkdir(workspaceDir, { recursive: true })
 
   const files: Array<{ key: string; path: string; absolutePath: string }> = []
   const writeScopedFile = async (key: string, content: string) => {
-    const definition = getScopedConfigFileDefinition(tool.id, key, scope)
+    const definition = getScopedConfigFileDefinition(tool.id, key, scope, rootDir)
     if (!definition) return
     await mkdir(dirname(definition.absolutePath), { recursive: true })
     await writeFile(definition.absolutePath, content, 'utf-8')
@@ -1810,7 +1846,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     agentId: tool.id,
     mode,
     profile: scope.profile,
-    provider: scope.provider,
+    provider,
     model,
     apiMode,
     rootDir,
@@ -1917,8 +1953,14 @@ export async function startCodingAgentRun(
   }
 }
 
-export function sendCodingAgentRunInput(sessionId: string, input: string, systemPrompt?: string): { runId: string } {
-  return codingAgentRunManager.send(sessionId, input, { systemPrompt })
+export function sendCodingAgentRunInput(
+  sessionId: string,
+  input: string,
+  systemPrompt?: string,
+  images: CodingAgentImageInput[] = [],
+  storageInput?: string,
+): { runId: string } {
+  return codingAgentRunManager.send(sessionId, input, { systemPrompt, images, storageInput })
 }
 
 export function stopCodingAgentRun(sessionId: string): { stopped: boolean } {
