@@ -37,6 +37,9 @@ export interface QueuedRun {
   provider?: string
   model_groups?: Array<{ provider: string; models: string[] }>
   instructions?: string
+  groupSystemPrompt?: string
+  groupRoomId?: string
+  groupAgentId?: string
   profile: string
   workspace?: string | null
   source?: ChatRunSource
@@ -114,6 +117,8 @@ export interface ResponseRunState {
   responseId?: string
   reasoningMessageId?: number | string
   pendingReasoning?: string
+  toolBoundaryReasoning?: string
+  toolReasoning?: Map<string, string>
   insertedKeys: Set<string>
   toolCalls: Map<string, any>
 }

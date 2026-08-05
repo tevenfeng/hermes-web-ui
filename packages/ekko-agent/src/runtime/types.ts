@@ -2,11 +2,13 @@ import type { AgentMessage, ModelClient, ModelRequest, ModelUsage } from '../mod
 import type { AgentMessageInput, AgentOutputMessage } from '../model/messages'
 import type { AgentSkill } from '../skills/types'
 import type { AgentToolRegistry } from '../tools/registry'
-import type { AgentToolContext, AgentToolResult } from '../tools/types'
+import type { AgentToolAuthorizer, AgentToolContext, AgentToolResult } from '../tools/types'
 import type { AgentRuntimeEvent } from './events'
 import type { MemoryContext } from '../memory/types'
 import type { MemoryService } from '../memory/service'
 import type { SkillReviewUsageEvent } from '../skills/review'
+import type { EkkoLogWriter } from '../logging/file-logger'
+import type { EkkoRuntimeLogContext } from '../logging/runtime-logger'
 
 export interface AgentRuntimeContextEstimate {
   contextTokens: number
@@ -24,6 +26,8 @@ export interface AgentRuntimeOptions {
   /** Disable every tool source, including built-ins, MCP, memory, and skill tools. */
   toolsEnabled?: boolean
   tools?: AgentToolRegistry
+  /** Optional human authorization gate applied before every registered tool executes. */
+  toolAuthorizer?: AgentToolAuthorizer
   /** Disable every skill source, including constructor and per-run skills. */
   skillsEnabled?: boolean
   skills?: AgentSkill[]
@@ -36,11 +40,13 @@ export interface AgentRuntimeOptions {
   maxSteps?: number
   maxModelRetries?: number
   maxConsecutiveToolFailures?: number
-  toolDelayMs?: number
   toolContext?: AgentToolContext
   modelDefaults?: Omit<ModelRequest, 'messages' | 'tools' | 'stream'>
   contextKey?: string
   memory?: MemoryService
+  /** Internal structured log sink owned by the Ekko runtime. */
+  logWriter?: EkkoLogWriter
+  logProfile?: string
 }
 
 export interface AgentRuntimeRunInput {
@@ -51,7 +57,6 @@ export interface AgentRuntimeRunInput {
   maxSteps?: number
   maxModelRetries?: number
   maxConsecutiveToolFailures?: number
-  toolDelayMs?: number
   toolContext?: AgentToolContext
   model?: string
   temperature?: number
@@ -64,6 +69,10 @@ export interface AgentRuntimeRunInput {
   contextKey?: string
   context?: unknown
   memoryEnabled?: boolean
+  /** When false, delegate_task only accepts foreground mode for this run. */
+  backgroundDelegationEnabled?: boolean
+  /** Correlation fields only; log events and payloads remain runtime-owned. */
+  logContext?: EkkoRuntimeLogContext
   onMemoryUsage?: (input: {
     purpose: 'ekko-memory-summary'
     usage: ModelUsage

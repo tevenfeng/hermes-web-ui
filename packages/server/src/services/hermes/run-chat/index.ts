@@ -10,7 +10,7 @@
 import type { Server, Socket } from 'socket.io'
 import { logger } from '../../logger'
 import { getSystemPrompt } from '../../../lib/llm-prompt'
-import { clearSessionMessages, getSession, getSessionMetadata, listSessions, updateMessageDisplayContent } from '../../../db/hermes/session-store'
+import { clearSessionMessages, deleteSession, getSession, getSessionMetadata, listSessions, updateMessageDisplayContent } from '../../../db/hermes/session-store'
 import { getSessionCategory } from '../../../db/hermes/session-category-store'
 import { getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../hermes-profile'
 import {
@@ -32,6 +32,8 @@ import type { ChatCodingAgentId, ContentBlock, QueuedRun, SessionState } from '.
 import { authenticateUserToken, isAuthEnabled, type AuthenticatedUser } from '../../../middleware/user-auth'
 import { userCanAccessProfile } from '../../../db/hermes/users-store'
 import { observeRunChatPetEvent } from '../pet-state-socket'
+import { codingAgentRunManager } from '../../agent-runner/coding-agent-run-manager'
+import { respondToEkkoToolApproval } from '../../ekko-agent/approvals'
 
 export type { ContentBlock } from './types'
 
@@ -273,6 +275,9 @@ export class ChatRunSocket {
       session_id?: string
       model?: string
       instructions?: string
+      group_system_prompt?: string
+      group_room_id?: string
+      group_agent_id?: string
       provider?: string
       model_groups?: Array<{ provider: string; models: string[] }>
       queue_id?: string
@@ -355,6 +360,9 @@ export class ChatRunSocket {
             provider: data.provider,
             model_groups: data.model_groups,
             instructions: data.instructions,
+            groupSystemPrompt: data.group_system_prompt,
+            groupRoomId: data.group_room_id,
+            groupAgentId: data.group_agent_id,
             profile: runProfile,
             workspace: data.workspace,
             source,
@@ -439,6 +447,23 @@ export class ChatRunSocket {
 
     socket.on('approval.respond', async (data: { session_id?: string; approval_id?: string; choice?: string }) => {
       if (!data.session_id || !data.approval_id) return
+      const ekkoResult = respondToEkkoToolApproval(
+        data.session_id,
+        data.approval_id,
+        data.choice,
+      )
+      if (ekkoResult.handled) {
+        if (!ekkoResult.resolved) {
+          this.emitToSession(socket, data.session_id, 'approval.resolved', {
+            event: 'approval.resolved',
+            approval_id: data.approval_id,
+            choice: ekkoResult.choice,
+            resolved: false,
+            error: 'Approval does not belong to this session.',
+          })
+        }
+        return
+      }
       try {
         const result = await this.bridge.approvalRespond(data.approval_id, data.choice || 'deny')
         this.emitToSession(socket, data.session_id, 'approval.resolved', {
@@ -493,6 +518,9 @@ export class ChatRunSocket {
       provider?: string
       model_groups?: Array<{ provider: string; models: string[] }>
       instructions?: string
+      group_system_prompt?: string
+      group_room_id?: string
+      group_agent_id?: string
       workspace?: string | null
       category_id?: number | null
       source?: string
@@ -514,6 +542,7 @@ export class ChatRunSocket {
       allow_command_passthrough?: boolean
       reasoning_effort?: string
       background_delegation_enabled?: boolean
+      context_compression_enabled?: boolean
       background_delegation_id?: string
       background_claim_id?: string
       autonomous?: boolean
@@ -983,6 +1012,9 @@ export class ChatRunSocket {
       provider: next.provider,
       model_groups: next.model_groups,
       instructions: next.instructions,
+      group_system_prompt: next.groupSystemPrompt,
+      group_room_id: next.groupRoomId,
+      group_agent_id: next.groupAgentId,
       workspace: next.workspace,
       source: next.source,
       session_source: next.sessionSource,
@@ -1021,6 +1053,9 @@ export class ChatRunSocket {
       provider?: string
       model_groups?: Array<{ provider: string; models: string[] }>
       instructions?: string
+      group_system_prompt?: string
+      group_room_id?: string
+      group_agent_id?: string
       workspace?: string | null
       source?: string
       session_source?: 'global_agent' | 'workflow'
@@ -1040,9 +1075,16 @@ export class ChatRunSocket {
       reasoning_effort?: string
       /** Hermes Agent creation policy used by internal orchestration callers. */
       background_delegation_enabled?: boolean
+      context_compression_enabled?: boolean
       one_shot_model?: boolean
     },
-    options: { profile?: string; user?: AuthenticatedUser; timeoutMs?: number; approvalChoice?: ChatRunAutoApprovalChoice } = {},
+    options: {
+      profile?: string
+      user?: AuthenticatedUser
+      timeoutMs?: number
+      approvalChoice?: ChatRunAutoApprovalChoice
+      onEvent?: (event: string, payload: any) => void
+    } = {},
   ): Promise<ChatRunAndWaitResult> {
     const sessionId = String(data.session_id || '').trim()
     if (!sessionId) throw new Error('session_id is required')
@@ -1117,6 +1159,11 @@ export class ChatRunSocket {
         if (typeof payload.run_id === 'string' && payload.run_id) runId = payload.run_id
         if (event === 'message.delta' && typeof payload.delta === 'string') output += payload.delta
         if ((event === 'reasoning.delta' || event === 'thinking.delta') && typeof payload.delta === 'string') reasoning += payload.delta
+        try {
+          options.onEvent?.(event, payload)
+        } catch (err) {
+          logger.warn(err, '[chat-run-socket] runAndWait event observer failed for session %s', sessionId)
+        }
         if (event === 'approval.requested') {
           void respondToApproval(payload)
         } else if (event === 'run.completed') {
@@ -1192,6 +1239,17 @@ export class ChatRunSocket {
       event: 'run.failed',
       error: reason,
     })
+  }
+
+  async disposeSession(sessionId: string): Promise<void> {
+    const sid = String(sessionId || '').trim()
+    if (!sid) return
+    codingAgentRunManager.stop(sid, { reportClosed: false })
+    const state = this.sessionMap.get(sid)
+    state?.abortController?.abort()
+    this.sessionMap.delete(sid)
+    this.runWaiters.delete(sid)
+    deleteSession(sid)
   }
 
   emitExternalEvent(sessionId: string, event: string, payload: any) {

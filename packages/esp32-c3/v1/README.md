@@ -29,6 +29,32 @@ firmware into `packages/esp32-c3/release/v1/firmware.bin` and package it into
 `dist/mcu/v1/firmware.bin`. GitHub release builds reuse the checked-in release
 firmware and do not build ESP32 firmware in CI.
 
+## Speak Subtitles
+
+During MCU speech playback, the OLED renders the active audio segment's text
+with the compressed WenQuanYi 12px GB2312 font. Long text is wrapped into
+three-line pages. Page timing follows elapsed playback time capped by queued
+PCM or ADPCM sample progress, so DMA prebuffering cannot advance the first page
+early. The playback progress bar is removed to make room for the third line.
+The subtitle is cleared or replaced only when that audio segment finishes, is
+interrupted, or the next segment starts. The complete audio-segment text is
+retained for paging rather than being shortened to the OLED status-preview
+length. Wrapped lines are prepared once before playback, and only the subtitle
+rows are sent over I²C when the page changes.
+
+## Voice Modes
+
+The device page can switch between the existing push-to-talk mode and an
+automatic listening mode. Automatic listening runs a lightweight VAD entirely
+on the ESP32-C3 while the device is idle. It keeps about 800 ms of local
+pre-roll, opens the existing ADPCM voice stream only after sustained
+speech-like activity, and ends the turn after one second of silence.
+
+Listening is suspended while a turn is transcribing, thinking, using tools, or
+playing speech, so device playback cannot trigger a new turn. The existing
+button controls remain unchanged: long press talks, single click stops the
+current response, and double click clears the session.
+
 From the repository root, use:
 
 ```bash

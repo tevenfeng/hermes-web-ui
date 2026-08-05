@@ -277,7 +277,7 @@ describe('ekko-agent runtime', () => {
           finishReason: 'tool_calls',
         }
       : { content: 'tool said from-tool', finishReason: 'stop' })
-    const runtime = new AgentRuntime({ modelClient: client, tools, toolDelayMs: 0 })
+    const runtime = new AgentRuntime({ modelClient: client, tools })
 
     const result = await runtime.run({ messages: ['use echo'] })
 
@@ -316,7 +316,7 @@ describe('ekko-agent runtime', () => {
       if (call === 2) return { content: 'Child inspection result', finishReason: 'stop' }
       return { content: 'Parent used the child result', finishReason: 'stop' }
     })
-    const runtime = new AgentRuntime({ modelClient: client, tools, toolDelayMs: 0 })
+    const runtime = new AgentRuntime({ modelClient: client, tools })
     const events: any[] = []
 
     const result = await runtime.run({
@@ -329,7 +329,8 @@ describe('ekko-agent runtime', () => {
     const childPrompt = requests[1].messages.find(message => message.role === 'user')?.content
     expect(childPrompt).toContain('Inspect the implementation')
     expect(childPrompt).toContain('Focus on runtime.ts')
-    expect(requests[1].tools?.map(tool => tool.name)).not.toContain('delegate_task')
+    expect(requests[1].tools).toBeUndefined()
+    expect(requests[1].toolChoice).toBeUndefined()
     expect(result.steps.find(step => step.type === 'tool')).toMatchObject({
       type: 'tool',
       toolName: 'delegate_task',
@@ -392,7 +393,7 @@ describe('ekko-agent runtime', () => {
       }),
       stream: vi.fn(),
     }
-    const runtime = new AgentRuntime({ modelClient: client, tools, toolDelayMs: 0 })
+    const runtime = new AgentRuntime({ modelClient: client, tools })
     const events: any[] = []
 
     const result = await runtime.run({
@@ -435,6 +436,49 @@ describe('ekko-agent runtime', () => {
     ]))
   })
 
+  it('removes and rejects background delegation when the run disables it', async () => {
+    const tools = new AgentToolRegistry()
+    tools.register(new DelegateTaskTool())
+    const requests: ModelRequest[] = []
+    const client = modelClient((request, call) => {
+      requests.push(request)
+      if (call === 1) {
+        return {
+          content: '',
+          toolCalls: [{
+            id: 'delegate-disabled',
+            name: 'delegate_task',
+            arguments: { goal: 'Run validation later', mode: 'background' },
+          }],
+          finishReason: 'tool_calls',
+        }
+      }
+      return { content: 'Background delegation was unavailable.', finishReason: 'stop' }
+    })
+    const runtime = new AgentRuntime({ modelClient: client, tools })
+    const events: any[] = []
+
+    const result = await runtime.run({
+      messages: ['Do the work'],
+      metadata: { session_id: 'no-background-session' },
+      backgroundDelegationEnabled: false,
+      onEvent: event => events.push(event),
+    })
+
+    const delegateDefinition = requests[0].tools?.find(tool => tool.name === 'delegate_task')
+    expect((delegateDefinition?.parameters?.properties as any)?.mode?.enum).toEqual(['foreground'])
+    expect(result.steps.find(step => step.type === 'tool')).toMatchObject({
+      type: 'tool',
+      toolName: 'delegate_task',
+      result: {
+        ok: false,
+        error: 'Background subtask delegation is disabled for this run. Use foreground mode.',
+      },
+    })
+    expect(runtime.hasBackgroundTasks('no-background-session')).toBe(false)
+    expect(events.some(event => event.type === 'subagent.start')).toBe(false)
+  })
+
   it('aborts detached background delegated tasks by session', async () => {
     const tools = new AgentToolRegistry()
     tools.register(new DelegateTaskTool())
@@ -475,7 +519,7 @@ describe('ekko-agent runtime', () => {
       }),
       stream: vi.fn(),
     }
-    const runtime = new AgentRuntime({ modelClient: client, tools, toolDelayMs: 0 })
+    const runtime = new AgentRuntime({ modelClient: client, tools })
     const events: any[] = []
 
     await runtime.run({
@@ -529,7 +573,7 @@ describe('ekko-agent runtime', () => {
     })
 
     try {
-      const result = await new AgentRuntime({ modelClient: client, tools, toolDelayMs: 0 })
+      const result = await new AgentRuntime({ modelClient: client, tools })
         .run({ messages: ['list profiles'] })
       expect(result.output.content).toBe('done')
     } finally {
@@ -549,7 +593,7 @@ describe('ekko-agent runtime', () => {
       }
       return { content: 'done', finishReason: 'stop' }
     })
-    const runtime = new AgentRuntime({ modelClient: client, toolDelayMs: 0 })
+    const runtime = new AgentRuntime({ modelClient: client })
 
     const result = await runtime.run({
       messages: ['use mcp'],
@@ -579,7 +623,7 @@ describe('ekko-agent runtime', () => {
           toolCalls: [{ id: 'call_missing', name: 'missing_tool', arguments: {} }],
         }
       : { content: 'handled missing tool' })
-    const runtime = new AgentRuntime({ modelClient: client, tools: new AgentToolRegistry(), maxSteps: 2, toolDelayMs: 0 })
+    const runtime = new AgentRuntime({ modelClient: client, tools: new AgentToolRegistry(), maxSteps: 2 })
 
     const result = await runtime.run({ messages: ['call missing'] })
 
@@ -602,7 +646,6 @@ describe('ekko-agent runtime', () => {
       tools: new AgentToolRegistry(),
       maxConsecutiveToolFailures: 2,
       maxSteps: 10,
-      toolDelayMs: 0,
     })
     const events: string[] = []
 
@@ -848,7 +891,6 @@ describe('ekko-agent runtime', () => {
       modelClient: client,
       skillDirectory,
       skillReviewEveryToolCalls: 1,
-      toolDelayMs: 0,
     })
 
     try {
@@ -1047,6 +1089,10 @@ describe('ekko-agent runtime', () => {
     expect(prompt).toContain('## Tool Execution')
     expect(prompt).toContain('prerequisites named by a Skill as requirements, not proof that they are installed')
     expect(prompt).toContain('perform a lightweight availability check')
+    expect(prompt).toContain('use code_exec, including for one-line snippets')
+    expect(prompt).toContain('Do not probe Node or Python with terminal_exec first')
+    expect(prompt).toContain('Use terminal_exec for CLI commands')
+    expect(prompt).toContain('do not retry the operation through another tool or language runtime')
     expect(prompt).toContain('prefer a compatible installed or built-in alternative')
   })
 })

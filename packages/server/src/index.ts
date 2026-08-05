@@ -26,6 +26,7 @@ import { refreshConfiguredProviderModelCatalogsInBackground } from './services/h
 import { scanLanDevices, startLanDiscoveryResponder } from './services/lan-discovery'
 import { getLanPeerSocketManager, getLanPeerSocketPath } from './services/lan-peer-socket'
 import { startGlobalAgentServer } from './services/global-agent/server'
+import { setupGlobalEkkoAgent } from './services/ekko-agent/manager'
 import { WorkflowSocketServer } from './services/workflow-socket'
 import { PetStateSocketServer } from './services/hermes/pet-state-socket'
 import { logger } from './services/logger'
@@ -279,6 +280,9 @@ export async function bootstrap() {
     console.warn('[bootstrap] failed to inject bundled MCP server:', err instanceof Error ? err.message : err)
   }
 
+  setupGlobalEkkoAgent()
+  console.log('[bootstrap] ekko-agent setup complete')
+
   if (!isDesktopRuntime()) {
     await startRuntimeServicesBeforeListen()
   }
@@ -340,6 +344,7 @@ export async function bootstrap() {
   // Chat run Socket.IO — shares the same Server instance, just adds /chat-run namespace
   chatRunServer = new ChatRunSocket(groupChatServer.getIO())
   setChatRunServer(chatRunServer)
+  groupChatServer.setChatRunService(chatRunServer)
   chatRunServer.init()
 
   // A process restart loses in-memory scheduler, approval, and runner ownership.

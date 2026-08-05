@@ -3,7 +3,6 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from 
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
 import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
-import { useProfilesStore } from '@/stores/hermes/profiles'
 import {
     copyTextToClipboard,
     extractUnifiedDiffPayload,
@@ -25,6 +24,8 @@ import ToolChangeCard from '@/components/hermes/chat/ToolChangeCard.vue'
 import { useFilesStore } from '@/stores/hermes/files'
 import { useToolPanelStore } from '@/stores/hermes/tool-panel'
 import { isServerTtsProvider } from '@/api/hermes/tts'
+import { groupAgentAvatar, parseStoredAvatar } from '@/utils/group-agent-avatar'
+import GroupAgentMessageAvatar from './GroupAgentMessageAvatar.vue'
 
 const MarkdownRenderer = defineAsyncComponent(async () => (await import('../chat/MarkdownRenderer.vue')).default)
 
@@ -41,12 +42,16 @@ const props = defineProps<{
     agents: RoomAgent[]
     members?: MemberInfo[]
     currentUserId?: string
+    embedded?: boolean
+}>()
+
+const emit = defineEmits<{
+    mentionAgent: [agent: RoomAgent]
 }>()
 
 const { t } = useI18n()
 const toast = useMessage()
 const groupChatStore = useGroupChatStore()
-const profilesStore = useProfilesStore()
 const filesStore = useFilesStore()
 const toolPanelStore = useToolPanelStore()
 const speech = useGlobalSpeech()
@@ -69,11 +74,9 @@ const isSelf = computed(() => {
 const agentInfo = computed(() => {
     return props.agents.find(a => a.agentId === props.message.senderId || a.name === props.message.senderName)
 })
+const messageTtsProfile = computed(() => agentInfo.value?.profile?.trim() || '')
 
 const timeStr = computed(() => formatChatTimestamp(props.message.timestamp))
-
-const avatarProfileName = computed(() => agentInfo.value?.profile || props.message.senderName || props.message.senderId)
-const avatarProfile = computed(() => profilesStore.profiles.find(profile => profile.name === agentInfo.value?.profile))
 
 // 找当前消息发送者在 members 里的记录
 const memberInfo = computed(() => {
@@ -86,26 +89,20 @@ const memberInfo = computed(() => {
 
 // 解析 member 的 avatar JSON
 const memberAvatar = computed(() => {
-    const av = memberInfo.value?.avatar
-    if (!av) return null
-    try {
-        const parsed = typeof av === 'string' ? JSON.parse(av) : av
-        if (parsed && parsed.type === 'image' && parsed.dataUrl) return parsed
-    } catch {}
-    return null
+    return parseStoredAvatar(memberInfo.value?.avatar)
 })
 
 // 当前消息要显示的头像(profile / member / fallback)
 const currentAvatar = computed(() => {
     if (isAgent.value) {
-        return avatarProfile.value?.avatar ?? null
+        return groupAgentAvatar(agentInfo.value)
     }
     return memberAvatar.value
 })
 
 // 给 ProfileAvatar 的 name seed
 const avatarDisplayName = computed(() => {
-    if (isAgent.value) return avatarProfileName.value
+    if (isAgent.value) return agentInfo.value?.agent || 'hermes'
     return props.message.senderName || props.message.senderId || 'user'
 })
 
@@ -213,7 +210,11 @@ const assistantWorkspaceChanges = computed(() => props.message.workspaceChanges 
 const selectedWorkspaceDiffFileId = computed(() => toolPanelStore.workspaceDiff?.file.id ?? null)
 const toolArgsPayload = computed(() => formatToolPayload(props.message.toolArgs))
 const toolResultPayload = computed(() => formatToolPayload(props.message.toolResult, true))
-const hasToolDetails = computed(() => !!(toolArgsPayload.value.full || toolResultPayload.value.full))
+const hasToolDetails = computed(() => !!(
+    props.message.reasoning?.trim()
+    || toolArgsPayload.value.full
+    || toolResultPayload.value.full
+))
 const fullToolArgs = computed(() => toolArgsPayload.value.full)
 const formattedToolArgs = computed(() => toolArgsPayload.value.display)
 const fullToolResult = computed(() => toolResultPayload.value.full)
@@ -247,17 +248,18 @@ function openWorkspaceDiffFileForPayload(file: GroupWorkspaceDiffFile, payload: 
 const canPlaySpeech = computed(() => {
     if (props.message.role !== 'assistant') return false
     if (!assistantBody.value.trim()) return false
+    if (messageTtsProfile.value) return true
     if (isServerTtsProvider(voiceSettings.provider.value)) return true
     return speech.isSupported
 })
 const isPlayingThisMessage = computed(() => {
-    if (isServerTtsProvider(voiceSettings.provider.value)) {
+    if (messageTtsProfile.value || isServerTtsProvider(voiceSettings.provider.value)) {
         return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPlaying.value
     }
     return speech.currentMessageId.value === props.message.id && speech.isPlaying.value
 })
 const isPausedThisMessage = computed(() => {
-    if (isServerTtsProvider(voiceSettings.provider.value)) {
+    if (messageTtsProfile.value || isServerTtsProvider(voiceSettings.provider.value)) {
         return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPaused.value
     }
     return speech.currentMessageId.value === props.message.id && speech.isPaused.value
@@ -418,8 +420,14 @@ function handleAutoplayTtsError(err: unknown) {
     console.warn('[GroupMessageItem] TTS autoplay failed:', err)
 }
 
-function playSpeech(content: string, autoplay = false) {
+function playSpeech(content: string, autoplay = false, profileOverride = '') {
     if (!content.trim()) return
+    const profile = profileOverride.trim() || messageTtsProfile.value
+    if (profile) {
+        if (autoplay) speech.enqueueProfileSpeech(props.message.id, content, profile)
+        else speech.profileToggle(props.message.id, content, profile)
+        return
+    }
     if (voiceSettings.provider.value === 'openai') {
         if (!voiceSettings.openaiBaseUrl.value) return
         const options = {
@@ -568,9 +576,9 @@ let autoPlayHandler: ((e: Event) => void) | null = null
 
 onMounted(() => {
     autoPlayHandler = (e: Event) => {
-        const event = e as CustomEvent<{ messageId: string; content: string }>
+        const event = e as CustomEvent<{ messageId: string; content: string; profile?: string }>
         if (event.detail?.messageId === props.message.id && canPlaySpeech.value) {
-            playSpeech(event.detail.content || assistantBody.value, true)
+            playSpeech(event.detail.content || assistantBody.value, true, event.detail.profile)
         }
     }
     window.addEventListener('auto-play-speech', autoPlayHandler)
@@ -583,13 +591,19 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-    <div v-if="isToolMessage" class="group-message tool-message">
-        <div class="avatar">
-            <ProfileAvatar :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
+    <div v-if="isToolMessage" class="group-message tool-message" :class="{ embedded }">
+        <div v-if="!embedded" class="avatar">
+            <GroupAgentMessageAvatar
+                v-if="isAgent && agentInfo"
+                :agent="agentInfo"
+                :size="36"
+                @mention="emit('mentionAgent', $event)"
+            />
+            <ProfileAvatar v-else :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
         </div>
 
         <div class="msg-body">
-            <div class="msg-header">
+            <div v-if="!embedded" class="msg-header">
                 <span class="sender-name">{{ message.senderName }}</span>
                 <span v-if="isAgent && agentInfo?.description" class="agent-desc">{{ agentInfo.description }}</span>
             </div>
@@ -616,6 +630,12 @@ onBeforeUnmount(() => {
                 <span v-if="message.toolStatus === 'error'" class="tool-error-badge">{{ t('chat.error') }}</span>
             </div>
             <div v-if="toolExpanded && hasToolDetails" class="tool-details" @click="handleToolDetailClick">
+                <div v-if="message.reasoning?.trim()" class="tool-detail-section">
+                    <div class="tool-detail-label">{{ t('chat.thinkingLabel') }}</div>
+                    <div class="tool-detail-reasoning">
+                        <MarkdownRenderer :content="message.reasoning" />
+                    </div>
+                </div>
                 <div v-if="formattedToolArgs" class="tool-detail-section" data-copy-source="tool-args">
                     <div class="tool-detail-label">{{ t('chat.arguments') }}</div>
                     <div class="tool-detail-code-block" v-html="renderedToolArgs"></div>
@@ -625,17 +645,23 @@ onBeforeUnmount(() => {
                     <div class="tool-detail-code-block" v-html="renderedToolResult"></div>
                 </div>
             </div>
-            <span class="msg-time">{{ timeStr }}</span>
+            <span v-if="!embedded" class="msg-time">{{ timeStr }}</span>
         </div>
     </div>
-    <div v-else class="group-message" :class="{ agent: isAgent, self: isSelf }">
+    <div v-else class="group-message" :class="{ agent: isAgent, self: isSelf, embedded }">
         <!-- Avatar -->
-        <div class="avatar">
-            <ProfileAvatar :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
+        <div v-if="!embedded" class="avatar">
+            <GroupAgentMessageAvatar
+                v-if="isAgent && agentInfo"
+                :agent="agentInfo"
+                :size="36"
+                @mention="emit('mentionAgent', $event)"
+            />
+            <ProfileAvatar v-else :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
         </div>
 
         <div class="msg-body">
-            <div class="msg-header">
+            <div v-if="!embedded" class="msg-header">
                 <span class="sender-name">{{ message.senderName }}</span>
                 <span v-if="isAgent && agentInfo?.description" class="agent-desc">{{ agentInfo.description }}</span>
             </div>
@@ -715,6 +741,7 @@ onBeforeUnmount(() => {
             <div class="message-meta">
                 <button
                     v-if="canPlaySpeech"
+                    type="button"
                     class="speech-bubble-btn"
                     :class="{ playing: isPlayingThisMessage, paused: isPausedThisMessage }"
                     :title="isPlayingThisMessage ? (isPausedThisMessage ? t('chat.resumeSpeech') : t('chat.pauseSpeech')) : t('chat.playSpeech')"
@@ -725,6 +752,7 @@ onBeforeUnmount(() => {
                 </button>
                 <button
                     v-if="copyableContent"
+                    type="button"
                     class="copy-bubble-btn"
                     :title="t('chat.copyBubble')"
                     @click="copyBubbleContent"
@@ -736,6 +764,7 @@ onBeforeUnmount(() => {
                 </button>
                 <button
                     v-if="quotableContent"
+                    type="button"
                     class="reference-bubble-btn"
                     :title="t('chat.referenceMessage')"
                     @click="referenceBubbleContent"
@@ -745,7 +774,7 @@ onBeforeUnmount(() => {
                         <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
                     </svg>
                 </button>
-                <span class="message-time">{{ timeStr }}</span>
+                <span v-if="!embedded" class="message-time">{{ timeStr }}</span>
             </div>
         </div>
     </div>
@@ -798,10 +827,38 @@ onBeforeUnmount(() => {
     &.self .msg-content {
         background-color: rgba(var(--accent-primary-rgb), 0.06);
     }
+
+    &.embedded {
+        width: 100%;
+        padding: 0;
+        gap: 0;
+
+        .msg-body {
+            width: 100%;
+            max-width: 100%;
+        }
+
+        .msg-content,
+        &.agent .msg-content.agent-content,
+        &.self .msg-content {
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            padding: 8px 10px;
+        }
+
+        .message-meta {
+            padding-inline: 10px;
+        }
+    }
 }
 
 .tool-message {
     align-items: flex-start;
+
+    &.embedded {
+        padding: 4px 8px;
+    }
 }
 
 .tool-line {
@@ -923,6 +980,25 @@ onBeforeUnmount(() => {
     }
 }
 
+.tool-detail-reasoning {
+    max-height: 300px;
+    overflow-y: auto;
+    padding: 8px 10px;
+    border: 1px solid $border-light;
+    border-radius: $radius-sm;
+    background: rgba(var(--text-primary-rgb), 0.035);
+    color: $text-secondary;
+    font-size: 12px;
+
+    :deep(.markdown-body > :first-child) {
+        margin-top: 0;
+    }
+
+    :deep(.markdown-body > :last-child) {
+        margin-bottom: 0;
+    }
+}
+
 @keyframes spin {
     to {
         transform: rotate(360deg);
@@ -979,15 +1055,25 @@ onBeforeUnmount(() => {
     gap: 6px;
     margin-top: 4px;
     padding: 0 4px;
+    padding-bottom: 4px;
     color: $text-muted;
-    opacity: 0;
-    transition: opacity 0.15s ease;
+    opacity: 1;
+}
 
-    .group-message:hover & {
-        opacity: 1;
+.group-message:not(.agent) {
+    .message-meta {
+        opacity: 0;
+        transition: opacity 0.15s ease;
     }
 
-    @media (max-width: 768px) {
+    &:hover .message-meta,
+    &:focus-within .message-meta {
+        opacity: 1;
+    }
+}
+
+@media (max-width: 768px) {
+    .group-message:not(.agent) .message-meta {
         opacity: 1;
     }
 }
@@ -1114,9 +1200,9 @@ onBeforeUnmount(() => {
     }
 }
 
-:global(html.theme-has-custom-background .group-message .msg-content:not(.agent-error)),
-:global(html.theme-has-custom-background .group-message.agent .msg-content.agent-content:not(.agent-error)),
-:global(html.theme-has-custom-background .group-message.self .msg-content:not(.agent-error)) {
+:global(html.theme-has-custom-background .group-message:not(.embedded) .msg-content:not(.agent-error)),
+:global(html.theme-has-custom-background .group-message.agent:not(.embedded) .msg-content.agent-content:not(.agent-error)),
+:global(html.theme-has-custom-background .group-message.self:not(.embedded) .msg-content:not(.agent-error)) {
     background-color: rgba(var(--bg-main-surface-rgb), 0.78);
     border: 1px solid rgba(var(--text-primary-rgb), 0.18);
     -webkit-backdrop-filter: blur(8px) saturate(110%);
